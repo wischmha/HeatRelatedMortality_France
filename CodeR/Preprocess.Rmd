@@ -1,0 +1,274 @@
+---
+title:  "Heatwave mortality in France from 1990 to 2025 in high spatiotemporal resolution"
+author: "Hans-Aloys Wischmann, Institute for Public Health, Charité - Universitätsmedizin Berlin"
+date:   "Rewritten: 2026-05-16 to 2026-07-08 / Executed: `r Sys.Date()`"
+output:
+  officedown::rdocx_document:
+    reference_docx: Template.docx
+    tables:
+      style: Normal
+    plots:
+      style: Normal
+---
+# Setup
+
+```{r setup, include = FALSE}
+  source("./Parameters.R")
+  library(readxl)
+  library(ncdf4)
+
+  # process all conceivable, well-formed 5-digit COGs except for overseas territories
+  COG_METRO <- c(sprintf("%05d", 01001:95999), sprintf("2A%03d", 001:999), sprintf("2B%03d", 001:999))
+
+  # departements mapped to five climate categories (https://meteo45.com/climat_de_la_france.html)
+  CLIMAT <- rbind(data.frame(climat = "Océanique",        departement = c("40", "33", "17", "85", "79", "44", "49", "56", "29", "22", "35",
+                                                                          "53", "72", "50", "14", "61", "27", "76", "60", "80", "62", "59")),
+                  data.frame(climat = "Océanique altéré", departement = c("32", "31", "47", "82", "81", "24", "46", "16", "87", "86", "37",
+                                                                          "36", "03", "41", "18", "58", "71", "28", "45", "89", "21", "78",
+                                                                          "75", "91", "92", "93", "94", "95", "77", "10", "52", "51", "55", "02", "08")),
+                  data.frame(climat = "Semi-continental", departement = c("69", "01", "39", "25", "70", "90", "88", "68", "54", "57", "67")),
+                  data.frame(climat = "Montagnard",       departement = c("64", "65", "09", "12", "48", "19", "15", "43", "23", "63", "42",
+                                                                          "04", "05", "38", "73", "74")),
+                  data.frame(climat = "Méditerranéen",    departement = c("66", "11", "34", "30", "13", "84", "83", "06", "07", "26", "2A", "2B"))) %>%
+    mutate(climat = factor(climat, levels = c("Océanique", "Océanique altéré", "Semi-continental", "Montagnard", "Méditerranéen")))
+```
+# Geography: Communes (2025)
+
+```{r Geography}
+  # communes (https://www.data.gouv.fr/api/1/datasets/r/c70a1c2d-dc8a-4f33-90df-ece3692b2baf) at 50m resolution, append climate type by departement
+  # append rurality (https://www.insee.fr/fr/statistiques/fichier/8571524/fichier_diffusion_2025.xlsx) by commune, ordered rural, intermediate, urban
+  densite  <- read_excel("../Downloads/Rurality.xlsx", skip = 4) %>% select(code = CODGEO, densite = LIBDENS)
+  geo_info  <- as.data.frame(read_sf("../Downloads/Shapes.geojson")) %>% select(code, region, departement, geometry, commune = nom) %>%
+    filter(code %in% COG_METRO) %>% left_join(., CLIMAT, by = "departement") %>% left_join(., densite,  by = "code") %>%
+    mutate(densite = ifelse(is.na(densite) & grepl("Arrondissement$", commune), "Urbain dense", densite)) %>%
+    mutate(densite = factor_densite(densite))
+```
+# Population: Census (1990, 1999, 2006, 2011, 2016, and 2022)
+
+```{r Population}
+  # census information for communes over 3+ decades (https://www.insee.fr/fr/statistiques/fichier/1893204/pop-sexe-age-quinquennal6822.zip)
+  pop_info <- foreach (y = c(1990, 1999, 2006, 2011, 2016, 2022), .combine = rbind, .packages = c("tidyverse", "readxl", "dtplyr")) %dopar% {
+    read_excel("../Downloads/Population.xlsx", sheet = sprintf("COM_%d", y), skip = 12) %>%
+      select(DR = matches("^D.*e$"), CR = matches("^C"), matches(".*Hommes.*|.*Femmes.*")) %>% filter(DR != "DR") %>%
+      mutate(code = paste(str_sub(DR, 1, 2), CR, sep = "")) %>% select(-DR, -CR) %>% filter(code %in% COG_METRO, complete.cases(.)) %>%
+      pivot_longer(!code) %>% mutate(name = str_replace_all(name, c("^De " = "", "^95 " = "95 à 99 "))) %>%
+      separate_wider_regex(name, c(from = "[0-9]*", " à ", to = "[0-9]*", " ans.*\n", sex = ".*", "\nRP", year = "[0-9]{4}$")) %>%
+      mutate(across(c(from, to, year), ~as.integer(.)), sex = factor_sex(sex)) %>%
+      left_join(., AGE_BRACKETS, join_by("from" >= "age_from", "to" <= "age_to")) %>%
+      group_by(code, sex, age, year) %>% reframe(pop = sum(as.double(value)))
+  }
+```
+# Aggregate: Arrondissements to agglomerations (when lacking census information)
+
+```{r Arrondissements_Agglomerations}
+  # get arrondissements of Paris, Lyon, and Marseille, check which ones are lacking census information
+  arrondissements <- geo_info %>% filter(grepl("Arrondissement$", commune)) %>% mutate(commune = gsub(" [0-9].*", "", commune)) %>% select(arrondissement = code, ville = commune)
+  agglomerations  <- geo_info %>% filter(commune %in% c("Paris", "Lyon", "Marseille"))                                          %>% select(agglomeration  = code, ville = commune)
+  arron_to_agglom <- left_join(arrondissements, agglomerations, by = "ville") %>% filter(!arrondissement %in% unique(pop_info$code))
+  arron_to_agglom %>% select(ville, arrondissement, agglomeration) %>% flextable() %>% set_caption("Arrondissements mapped to agglomerations (because of missing census data)") %>% autofit()
+
+  # aggregate (and then remove) arrondissements (lacking census information), remember to aggregate deaths from arrondissements to agglomerations
+  pop_info <- rbind(pop_info %>% filter(!code %in% arron_to_agglom$arrondissement),
+                    pop_info %>% filter( code %in% arron_to_agglom$arrondissement) %>%
+                      left_join(., arron_to_agglom, join_by("code" == "arrondissement")) %>%
+                      group_by(code = agglomeration, sex, age, year) %>% reframe(pop = sum(pop)))
+  geo_info <- geo_info %>% filter(!code %in% arron_to_agglom$arrondissement)
+```
+# Mortality: Deaths (1990 to 2025)
+ 
+```{r Mortality}
+  # aggregated deaths (https://www.data.gouv.fr/api/1/datasets/r/c75fc1d6-a6ab-496b-962d-e12b9480ed41)
+  deaths <- fread("../Downloads/Deaths.csv", colClasses = "character", select = c("sexe", "date_naissance", "date_deces", "code_insee_deces")) %>%
+    filter(code_insee_deces %in% COG_METRO, grepl("[0-9]{8}", date_naissance), grepl("[0-9]{8}", date_deces)) %>%
+    mutate(year = str_sub(date_deces, 1, 4), sexe = factor_fm(sexe)) %>%
+    left_join(., geo_info %>% select(code) %>% mutate(code_insee_deces = gsub("^2[AB]", "20", code)), by = "code_insee_deces") %>%
+    mutate(code = ifelse(!is.na(code), code, code_insee_deces)) %>% select(-code_insee_deces)
+
+  # process individual deaths
+  deaths <- foreach (y = YEARS_ANALYZE, .combine = rbind, .packages = c("tidyverse", "dtplyr")) %dopar% {
+    deaths %>% filter(year == y) %>% mutate(across(starts_with("d"), ~as.Date(.x, format = "%Y%m%d"))) %>% filter(complete.cases(.)) %>% distinct() %>%
+    mutate(age_at_death = as.integer(difftime(date_deces, date_naissance, units = "days") / 365.25))   %>% filter(age_at_death %in% 0:max(AGE_BRACKETS$age_to)) %>%
+    left_join(., AGE_BRACKETS, join_by("age_at_death" >= "age_from", "age_at_death" <= "age_to")) %>%
+    left_join(., arron_to_agglom, join_by("code" == "arrondissement")) %>%
+    mutate(code = ifelse(!is.na(agglomeration), agglomeration, code)) %>% select(code, sex = sexe, age, date = date_deces)
+  }
+  append_time_log("Loaded: Geography, population, and deaths")
+```
+# History: Fusions and Splits of Communes
+
+```{r History}
+  # historic changes 1948-2023 (https://opendata.koumoul.com/data-fair/api/v1/datasets/anciens-codes-commune/data-files/cog-transformed.csv), reverse splits
+  changes <- fread("../Downloads/Changes_1948_2023.csv", colClasses = "character") %>% distinct() %>% group_by(COM_AV, DATE_EFF) %>% mutate(n_to = n()) %>% ungroup()
+  fusions <- changes %>% filter(n_to == 1) %>% select(from = COM_AV, to = COM_AP, DATE_EFF) # includes renames
+  splits  <- changes %>% filter(n_to != 1) %>% select(from = COM_AP, to = COM_AV, DATE_EFF)
+  changes <- rbind(fusions, splits) %>% mutate(date = as.Date(DATE_EFF)) %>% select(-DATE_EFF) %>% filter(year(date) %in% min(YEARS_ANALYZE):2003)
+  
+  # historic changes 2003-2025 (https://www.insee.fr/fr/statistiques/fichier/7671867/table_passage_geo2003_geo2025.zip), reverse splits to undo
+  renames <- read_excel("../Downloads/Changes_2003_2025.xlsx", sheet = "Liste des changements de code", skip = 5) %>% distinct() %>% select(from = COM_INI, to = COM_FIN, ANNEE_MODIF)
+  fusions <- read_excel("../Downloads/Changes_2003_2025.xlsx", sheet = "Liste des fusions",             skip = 5) %>% distinct() %>% select(from = COM_INI, to = COM_FIN, ANNEE_MODIF)
+  splits  <- read_excel("../Downloads/Changes_2003_2025.xlsx", sheet = "Liste des scissions",           skip = 5) %>% distinct() %>% select(from = COM_FIN, to = COM_INI, ANNEE_MODIF)
+  changes <- rbind(changes, rbind(renames, fusions, splits) %>% mutate(date = as.Date(sprintf("%.0f-01-01", ANNEE_MODIF))) %>% select(-ANNEE_MODIF)) %>% distinct()
+
+  # apply sequence of changes to all conceivable codes of communes, in correct temporal order
+  code_map <- data.frame(orig = COG_METRO) %>% mutate(code = orig)
+  for (d in sort(unique(changes$date))) {
+    code_map <- left_join(code_map, changes %>% filter(date == d) %>% select(from, to), join_by("code" == "from")) %>% mutate(code = ifelse(!is.na(to), to, code)) %>% select(-to)
+  }
+```
+# Regroup: Deaths, Population, and Communes
+
+```{r Regroup}
+  # aggregate by code mapping, for temporal continuity of communes
+  deaths   <- left_join(deaths   %>% rename(orig = code), code_map, by = "orig") %>% select(code, sex, age, date)
+  pop_info <- left_join(pop_info %>% rename(orig = code), code_map, by = "orig") %>% select(code, sex, age, year, pop)
+  geo_info <- left_join(geo_info %>% rename(orig = code), code_map, by = "orig") %>% select(code, region, climat, densite, geometry)
+
+  # process data aggregation in parallel, apply final touch-ups, aggregating to the most urban type (in case of differences)
+  deaths <- foreach (y = YEARS_ANALYZE, .combine = rbind, .packages = c("tidyverse", "dtplyr")) %dopar% {
+    deaths   %>% filter(year(date) == y) %>% group_by(code, sex, age, date) %>% reframe(n = n()) }
+  pop_info <- foreach (a = AGE_BRACKETS$age, .combine = rbind, .packages = c("tidyverse", "dtplyr")) %dopar% {
+    pop_info %>% filter(age == a)        %>% group_by(code, sex, age, year) %>% reframe(pop = sum(pop)) %>%
+    group_by(code, sex, age) %>% reframe(as.data.frame(approx(year, pop, xout = YEARS_ANALYZE, method = "linear", rule = 2))) %>% rename(year = x, pop = y) }
+  geo_info <- foreach (r = unique(geo_info$region), .combine = rbind, .packages = c("tidyverse", "dtplyr", "sf")) %dopar% {
+    geo_info %>% filter(region == r)     %>% group_by(code, climat) %>% reframe(densite = max(densite, na.rm = TRUE), geometry = st_union(geometry)) %>%
+    cbind(., as.data.frame(st_coordinates(st_centroid(.$geometry)))) %>% mutate(geometry = st_transform(geometry, crs = CRS_SF)) }
+  append_time_log("Regrouped: Deaths and exposed population")
+```
+# Exposure: Daily Mean Temperature [°C] and Humidity [%]
+
+```{r Temperature_Humidity}
+  # Remind acknowledgment and citations, read grid file for Europe (ensemble mean, all longitudes, all latitudes, staring one year prior to first analysis year)
+  print("We acknowledge the E-OBS dataset from the EU-FP6 project UERRA (https://www.uerra.eu) and the")
+  print("Copernicus Climate Change Service, and the data providers in the ECA&D project (https://www.ecad.eu)")
+  print("Cornes, R.C., van derSchrier, G., van denBesselaar, E.J.M., & Jones, P.D. (2018).")
+  print("An ensemble version of the E-OBS temperature and precipitation data sets.")
+  print("Journal of Geophysical Research: Atmospheres, 123, 9391–9409. https://doi.org/10.1029/2017JD028200")
+
+  # utility function to read, parse, and extract relevant data from ncdf file
+  read_nc <- function(filename, variable, geo_info, start_date) {
+    nc_file    <- nc_open(filename)
+    nc_date    <- ncvar_get(nc_file, "time") + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
+    nc_long    <- ncvar_get(nc_file, "longitude")
+    nc_lati    <- ncvar_get(nc_file, "latitude")
+    idx_date   <- first(which(nc_date >= start_date))
+    idx_long   <- first(which(nc_long >= min(geo_info$X) - 0.10))
+    idx_lati   <- first(which(nc_lati >= min(geo_info$Y) - 0.10))
+    num_long   <- last( which(nc_long <= max(geo_info$X) + 0.10)) - idx_long + 1
+    num_lati   <- last( which(nc_lati <= max(geo_info$Y) + 0.10)) - idx_lati + 1
+    nc_date    <- ncvar_get(nc_file, "time", start = idx_date) + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
+    nc_long    <- 0.10 * floor(10.0 * ncvar_get(nc_file, "longitude", start = idx_long, count = num_long)) + 0.05
+    nc_lati    <- 0.10 * floor(10.0 * ncvar_get(nc_file, "latitude",  start = idx_lati, count = num_lati)) + 0.05
+    data_3D    <- ncvar_get(nc_file, variable, start = c(idx_long, idx_lati, idx_date), count = c(num_long, num_lati, -1))
+    nc_status  <- nc_close(nc_file)
+
+    # determine combinations of longitude/latitude with valid temperature measurements (land areas), restrict to bounding box of metropolitan France with buffer
+    valid_nc <- as.data.frame(which(!is.na(data_3D[,,1]), arr.ind = TRUE)) %>% mutate(long = nc_long[row], lati = nc_lati[col]) %>% rename(long_index = row, lati_index = col)
+
+    # fast match where possible, otherwise closest point (manhattan distance) with valid temperature information
+    geo_lookup <- geo_info %>% select(code, X, Y) %>% mutate(across(c(X, Y), ~0.10 * floor(10.0 * .x) + 0.05)) %>% left_join(., valid_nc, join_by("X" == "long", "Y" == "lati"))
+    geo_issues <- geo_lookup %>% filter(!complete.cases(.)) %>% select(code, X, Y)
+    geo_nearby <- foreach (i = 1:nrow(geo_issues), .combine = rbind, .packages = c("tidyverse", "dtplyr")) %dopar% {
+      expand_grid(geo_issues[i,], valid_nc) %>% mutate(d = abs(X - long) + abs(Y - lati)) %>% arrange(d) %>% head(1) %>% select(code, X, Y, long_index, lati_index)
+    }
+    geo_lookup <- rbind(geo_lookup %>% filter(complete.cases(.)), geo_nearby %>% filter(complete.cases(.))) %>% arrange(code)
+
+    # efficiently gather daily mean temperature exposure for all communes for all days (noting matrix storage order in data_3D)
+    data_info <- data.frame(date = nc_date)
+    for (i in 1:nrow(geo_lookup)) {
+      data_info <- cbind(data_info, setNames(data.frame(data_3D[geo_lookup$long_index[i], geo_lookup$lati_index[i], ]), geo_lookup$code[i]))
+    }
+    rm(data_3D); gc(full = TRUE, verbose = FALSE)
+    return(data_info)
+  }
+
+  # read 2D table of daily mean temperature and relative humidity, warn about missing exposure data
+  tmpc_info <- read_nc("../Downloads/Temperature_1950_2025_v33.0e.nc", "tg", geo_info, as.Date(sprintf("%04d-01-01", min(YEARS_ANALYZE))))
+  hump_info <- read_nc("../Downloads/RelHumidity_1950_2025_v33.0e.nc", "hu", geo_info, as.Date(sprintf("%04d-01-01", min(YEARS_ANALYZE))))
+  rbind(hump_info %>% filter(!complete.cases(.)) %>% select(Date = date) %>% mutate(Missing = "Humidity"),
+        tmpc_info %>% filter(!complete.cases(.)) %>% select(Date = date) %>% mutate(Missing = "Temperature")) %>%
+    arrange(Date, Missing) %>% flextable() %>% set_caption("Dates with missing exposure data") %>% autofit()
+  append_time_log("Loaded: Temperature and humidity exposures")
+```
+# Report, Visualize, and Save
+
+```{r Plot_Save}
+  # document spread of recorded deaths across selected age groups, stratified by analysis period
+  deaths %>% mutate(year = year(date)) %>% left_join(., YEARS_PERIODS, by = "year") %>% filter(!is.na(period)) %>%
+    group_by(period, age) %>% reframe(n = n()) %>% group_by(period) %>% mutate(n = sprintf("%.01f%%", 100.0 * n / sum(n))) %>% ungroup() %>%
+    pivot_wider(names_from = period, values_from = n) %>%
+    flextable() %>% set_caption("Proportion of recorded deaths by age group") %>% align(align = "center", part = "all") %>% autofit()
+
+  # plot and save in parallel to save time
+  time_par <- foreach (tag = c("Plot_1", "Plot_2", "Plot_3", "Save_1", "Save_2", "Save_3"), .packages = c("tidyverse", "dtplyr", "sf"), .combine = rbind) %dopar% {
+    start_time <- proc.time()
+    if (tag == "Plot_1") {
+      # daily deaths, caveat: unexplained data issues in summer of 1997, consistent with (https://www.deces-en-france.fr/evenements/annee-1997)
+      plot_pdf_png("Figure_X1", aspect_ratio = 1.2,
+        deaths %>% group_by(Sex = sex, date) %>% reframe(n = sum(n)) %>% mutate(p = year(date), p = p - (p - min(YEARS_ANALYZE)) %% 9, p = sprintf("%d-%d", p, p + 8)) %>%
+        ggplot(aes(x = date, y = n, color = Sex)) + geom_line(linewidth = 0.3) +
+          scale_x_continuous(breaks = YEAR_BREAKS, labels = YEAR_LABELS) + scale_y_continuous(transform = "log10") + scale_color_manual(values = safe_colorblind_palette) +
+          labs(x = "", y = "Daily Deaths") + std_theme() + theme(legend.position = "top", axis.ticks.x = element_blank()) + facet_wrap(~p, ncol = 1, scales = "free_x"))
+      # daily deaths during heat waves of 2003 and 2019
+      plot_pdf_png("Figure_X6", aspect_ratio = 1.0,
+        deaths %>% filter((date >= as.Date("2003-08-01") & date <= as.Date("2003-08-20")) | (date >= as.Date("2019-07-14") & date <= as.Date("2019-08-02"))) %>%
+          mutate(year = year(date)) %>% group_by(Age = age, Sex = sex, year, date) %>% reframe(n = sum(n)) %>%
+        ggplot(aes(x = date, y = n, fill = Age)) + geom_bar(stat = "sum", position = "stack") + scale_fill_manual(values = safe_colorblind_palette) +
+          labs(title = "Heat waves: August 2003 and July 2019", x = "", y = "Daily Deaths") + std_theme() + facet_grid(vars(Sex), vars(year), scales = "free"))
+      # climate category by departement
+      plot_pdf_png("Figure_X7", aspect_ratio = 1.2,
+        geo_info %>% mutate(code = str_sub(code, 1, 2)) %>% group_by(climat, code) %>% mutate(geometry = st_union(geometry)) %>%
+        ggplot(aes(geometry = geometry, fill = climat)) + geom_sf(color = "black", linewidth = 0.1) + coord_sf(crs = CRS_SF) +
+          scale_fill_manual(values = safe_climate_palette) +
+          labs(fill = "Climat") + std_theme())
+      # density category by commune
+      plot_pdf_png("Figure_X8", aspect_ratio = 1.2,
+        geo_info %>%
+        ggplot(aes(geometry = geometry, fill = densite)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
+        labs(fill = "Densité") + std_theme())
+    } else if (tag == "Plot_2") {
+      # heat wave of 2003
+      plot_pdf_png("Figure_X2", aspect_ratio = 1.2,
+        left_join(tmpc_info %>% filter(date >= as.Date("2003-08-01"), date <= as.Date("2003-08-20")) %>% mutate(across(!date, ~pmin(pmax(.x, 13.0), 37.0))) %>%
+          pivot_longer(!date, names_to = "code", values_to = "tmpc"), geo_info, by = "code") %>%
+        ggplot(aes(geometry = geometry, fill = tmpc)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
+          scale_fill_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(13.0, 37.0), labels = ~paste(., "°C")) +
+          labs(title = "Heat wave: August 2003", fill = "Mean\nTemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+      plot_pdf_png("Figure_X3", aspect_ratio = 1.2,
+        left_join(hump_info %>% filter(date >= as.Date("2003-08-01"), date <= as.Date("2003-08-20")) %>%
+          pivot_longer(!date, names_to = "code", values_to = "hump"), geo_info, by = "code") %>%
+        ggplot(aes(geometry = geometry, fill = hump)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
+          scale_fill_gradientn(colors = safe_humidity_palette, breaks = seq(10, 90, 20), limits = c(0, 100), labels = ~paste(., "%")) +
+          labs(title = "Heat wave: August 2003", fill = "Relative\nHumidity") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == "Plot_3") {
+      # heat wave of 2019
+      plot_pdf_png("Figure_X4", aspect_ratio = 1.2,
+        left_join(tmpc_info %>% filter(date >= as.Date("2019-07-14"), date <= as.Date("2019-08-02")) %>% mutate(across(!date, ~pmin(pmax(.x, 13.0), 37.0))) %>%
+          pivot_longer(!date, names_to = "code", values_to = "tmpc"), geo_info, by = "code") %>%
+        ggplot(aes(geometry = geometry, fill = tmpc)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
+          scale_fill_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(13.0, 37.0), labels = ~paste(., "°C")) +
+          labs(title = "Heat wave: July 2019", fill = "Mean\nTemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+      plot_pdf_png("Figure_X5", aspect_ratio = 1.2,
+        left_join(hump_info %>% filter(date >= as.Date("2019-07-14"), date <= as.Date("2019-08-02")) %>%
+          pivot_longer(!date, names_to = "code", values_to = "hump"), geo_info, by = "code") %>%
+        ggplot(aes(geometry = geometry, fill = hump)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
+          scale_fill_gradientn(colors = safe_humidity_palette, breaks = seq(10, 90, 20), limits = c(0, 100), labels = ~paste(., "%")) +
+          labs(title = "Heat wave: July 2019", fill = "Relative\nHumidity") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == "Save_1") {
+      save(tmpc_info, file = "../Processed/Preprocessed_Temperature.Rdata", compress = "xz")
+    } else if (tag == "Save_2") {
+      save(hump_info, file = "../Processed/Preprocessed_Humidity.Rdata",    compress = "xz")
+    } else if (tag == "Save_3") {
+      save(deaths,    file = "../Processed/Preprocessed_Outcome.Rdata",     compress = "xz")
+      save(pop_info,  file = "../Processed/Preprocessed_Population.Rdata",  compress = "xz")
+      save(geo_info,  file = "../Processed/Preprocessed_Geography.Rdata",   compress = "xz")
+    }
+    simple_time_log(tag)
+  }
+  append_time_log("Completed: Preprocessing")
+```
+# Done
+
+```{r Done}
+  rbind(time_log, time_par) %>% flextable() %>% autofit()
+  rstudioapi::versionInfo(); sessionInfo()
+```
