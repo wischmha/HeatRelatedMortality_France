@@ -1,7 +1,7 @@
 ---
 title:  "Heatwave mortality in France from 1990 to 2025 in high spatiotemporal resolution"
 author: "Hans-Aloys Wischmann, Institute for Public Health, Charité - Universitätsmedizin Berlin"
-date:   "Rewritten: 2026-05-16 to 2026-07-08 / Executed: `r Sys.Date()`"
+date:   "Rewritten: 2026-05-16 to 2026-09-03 / Executed: `r Sys.Date()`"
 output:
   officedown::rdocx_document:
     reference_docx: Template.docx
@@ -18,33 +18,22 @@ output:
   library(broom)
 
   # configurable parameters
-  MAX_LAG <- 5 # maximum number of days to look back for exposures
-  MIN_POP <- 1 # minimum number of potentially exposed persons (population in a single commune, by year, climat, densite, sex, and age group)
-  print(sprintf("MAX_LAG = %s [days], MIN_POP = %d [persons per commune]", MAX_LAG, MIN_POP))
+  MAX_LAG <- 14 # maximum number of days to look back for exposures (one week)
+  DELTA_T <-  4 # distance between knots for temperature exposure (above 10°C): step size 4°C
+  print(sprintf("LAGS = 0:%s [days], DELTA_T = %.1f [°C]", MAX_LAG, DELTA_T))
 
-  # configurable inner knots for cubic regression splines, k = length(knots)
-  knots_tmpc <- function(vec, step) {
-    knots <- c(-10, -5, 0, 5, seq(10, 50, step))
-    knots <- c(min(vec), knots[which(knots >= min(vec) + 0.5 * step & knots <= max(vec) - 0.5 * step)], max(vec))
-    return(knots)
+  days_analyze <- data.frame(year = setdiff(YEARS_ANALYZE, YEARS_EXCLUDE)) %>%
+    mutate(first_monday = floor_date(as.Date(sprintf(SUMMER_START, year)), "week"), last_sunday = floor_date(as.Date(sprintf(SUMMER_END, year)), "week") + 6) %>%
+    group_by(year) %>% reframe(date = seq(first_monday, last_sunday, by = "day")) %>% as.data.frame()
+  period <- function(year) { return(case_when(year < 1990 ~ NA, year <= 1999 ~ "1990-1999", year <= 2004 ~ "2000-2004", year <= 2014 ~ "2005-2014", year <= 2025 ~ "2015-2025", TRUE ~ NA)) }
+
+  # all knots for cubic regression splines for mgcv::bam()
+  all_knots_tmpc <- function(vec, step = DELTA_T) {
+    knots <- c(seq(-10, 5, 5), seq(10, 50, step))
+    knots <- knots[which(knots >= min(vec) + 0.5 * step & knots <= max(vec) - 0.5 * step)]
+    return(c(min(vec), knots, max(vec)))
   }
-  knots_hump <- function(vec, n) {
-    return(seq(min(vec), max(vec), length.out = n))
-  }
-```
-# Load Preprocessed Data
 
-```{r Load}
-  # load preprocessed outcomes, geography, population, and exposures
-  load("../Processed/Preprocessed_Outcome.Rdata")
-  load("../Processed/Preprocessed_Geography.Rdata")
-  load("../Processed/Preprocessed_Population.Rdata")
-  load("../Processed/Preprocessed_Temperature.Rdata")
-  load("../Processed/Preprocessed_Humidity.Rdata")
-```
-# Regression Models
-
-```{r Model}
   # safe utility to extract and lag exposures
   safe_lag <- function(days, df, max_lag, basename) {
     for (lag in 0:max(max_lag, 0, na.rm = TRUE)) {
@@ -58,130 +47,167 @@ output:
     }
     return(ret)
   }
+```
+# Load Preprocessed Data
 
-  # stratify temporally using five periods of seven years each
-  for (p in unique(YEARS_PERIODS$period)) {
-    # analyze outcomes for all summer days for all years within period, extending to full weeks
-    years_in_period <- YEARS_PERIODS %>% filter(period == p) %>% pull("year")
-    days_analyze <- foreach(y = years_in_period, .combine = rbind, .packages = "tidyverse") %dopar% {
-      first_summer_day <- floor_date(as.Date(sprintf(SUMMER_START, y)), "week")     # Monday
-      last_summer_day  <- floor_date(as.Date(sprintf(SUMMER_END,   y)), "week") + 6 # Sunday
-      data.frame(date = seq(first_summer_day, last_summer_day, by = "day")) }
+```{r Load}
+  # reload outcomes, geography, and population
+  load("../Processed/Preprocessed_Outcome.Rdata")
+  load("../Processed/Preprocessed_Geography.Rdata")
+  load("../Processed/Preprocessed_Population.Rdata")
 
-    # stratify geographically by climat and densite
-    for (c in levels(geo_info$climat)) {
-      for (d in levels(geo_info$densite)) {
-        # compute matrix of lagged exposures (identical for both sexes and all age groups), for communes in climat/densite
-        communes <- geo_info %>% filter(climat == c, densite == d) %>% pull(code)
-        tmpc <- safe_lag(days_analyze, tmpc_info %>% select(date, all_of(communes)), MAX_LAG, "tmpc")
-        hump <- safe_lag(days_analyze, hump_info %>% select(date, all_of(communes)), MAX_LAG, "hump")
+  # document number of communes by climat and densite
+  geo_info %>% filter(code %in% pop_info$code) %>% group_by(Climat = climat, densite) %>% reframe(value = n()) %>% pivot_wider(names_from = densite) %>%
+    bind_rows(reframe(., across(where(is.numeric), ~sum(.x)), across(!where(is.numeric), ~"Total"))) %>%
+    flextable() %>% autofit() %>% set_caption("Stratification of Communes") %>% hline(i = 5)
+```
+# Regression Models
 
-        # stratify demographically by sex and age group
-        for (s in unique(pop_info$sex)) {
-          for (a in levels(pop_info$age)) {
-            # compile relevant inputs for regressions: outcomes, exposures, exposed population, secular/seasonal info, ignore communes with <1 exposed person(s)
-            df <- expand.grid(date = days_analyze$date, code = communes) %>%
-              mutate(year = year(date), yday = yday(date), wday = wday(date), monday = floor_date(date, "week")) %>%
-              left_join(., deaths   %>% filter(sex == s, age == a) %>% select(-sex, -age), by = c("code", "date")) %>% mutate(n = ifelse(is.na(n), 0, n)) %>%
-              left_join(., pop_info %>% filter(sex == s, age == a) %>% select(-sex, -age), by = c("code", "year")) %>% filter(!is.na(pop), pop >= MIN_POP) %>%
-              left_join(., tmpc,                                                           by = c("code", "date")) %>%
-              left_join(., hump,                                                           by = c("code", "date")) %>%
-              mutate(tmpc_lag_a = 0.25 * (tmpc_lag_0 + tmpc_lag_1 + tmpc_lag_2 + tmpc_lag_3)) %>% # compute average lagged exposure over prior 0:3 days
-              mutate(hump_lag_a = 0.25 * (hump_lag_0 + hump_lag_1 + hump_lag_2 + hump_lag_3)) %>% # compute average lagged exposure over prior 0:3 days
-              mutate(rate = n / pop, year = year - min(years_in_period)) %>% select(-date)
-            if (nrow(df) == 0 || sum(is.na(df)) != 0) { stop("Lookup failed for outcome and/or exposure and/or exposed population (daily models)") }
+Separate models are computed by degree of urbanization, climate zone, sex, age group, and period. Default links are retained: nb(`r nb()$link`), gaussian(`r gaussian()$link`).
+
+```{r Model}
+  # stratify geographically by densite and climat
+  for (d in rev(levels(geo_info$densite))) {
+    for (c in rev(levels(geo_info$climat))) {
+      # compute matrix of lagged exposures (identical for both sexes and all age groups), for communes in climat/densite
+      code <- geo_info %>% filter(climat == c, densite == d, code %in% unique(pop_info$code)) %>% pull(code)
+      load("../Processed/Preprocessed_Temperature.Rdata")
+      tmpc <- safe_lag(days_analyze %>% select(date), tmpc_info %>% select(date, all_of(code)), MAX_LAG, "tmpc"); rm(tmpc_info); invisible(gc(verbose = FALSE, full = TRUE))
+      load("../Processed/Preprocessed_Humidity.Rdata")
+      hump <- safe_lag(days_analyze %>% select(date), hump_info %>% select(date, all_of(code)), MAX_LAG, "hump"); rm(hump_info); invisible(gc(verbose = FALSE, full = TRUE))
+
+      # compile common inputs for regressions: exposures, secular/seasonal info, for all communes in climat and densite, compute average lagged exposure over prior 0:3 days
+      exposures <- cross_join(days_analyze, data.frame(code)) %>%
+        left_join(., tmpc, by = c("code", "date")) %>% mutate(tmpc = 0.25 * (tmpc_lag_0 + tmpc_lag_1 + tmpc_lag_2 + tmpc_lag_3)) %>%
+        left_join(., hump, by = c("code", "date")) %>% mutate(hump = 0.25 * (hump_lag_0 + hump_lag_1 + hump_lag_2 + hump_lag_3))
+      if (nrow(exposures) == 0 || sum(is.na(exposures)) != 0) { stop("Lookup failed for exposures") }
+      rm(code, tmpc, hump); invisible(gc(verbose = FALSE, full = TRUE))
+
+      # stratify demographically by sex and age group
+      for (s in rev(levels(deaths$sex))) {
+        for (a in rev(levels(deaths$age))) {
+          # append categorical covariates, outcomes, and exposed population (by sex and age group), and compute mortality rates
+          df_dcsa <- exposures %>% mutate(yday = yday(date), wday = wday(date), monday = floor_date(date, "week"), peri = period(year)) %>%
+            left_join(., deaths   %>% filter(sex == s, age == a), by = c("code", "date")) %>% select(-sex, -age) %>% mutate(n = ifelse(is.na(n), 0, n)) %>%
+            left_join(., pop_info %>% filter(sex == s, age == a), by = c("code", "year")) %>% select(-sex, -age) %>% filter(pop != 0.0) %>% mutate(rate = n / pmax(pop, n))
+          if (nrow(df_dcsa) == 0 || sum(is.na(df_dcsa)) != 0) { stop("Lookup failed for outcomes and/or exposed population") }
+
+          # stratify temporally by period, compute in parallel, new set of workers, twelve BLAS threads per parallel task, ignore any failures (result files not saved)
+          stopImplicitCluster(); invisible(gc(verbose = FALSE, full = TRUE)); config_parallel(length(unique(period(YEARS_ANALYZE))), 12)
+          completed <- foreach (p = unique(period(YEARS_ANALYZE)), .packages = c("tidyverse", "mgcv", "splines", "broom")) %dopar% { try({
+            if (file.exists(sprintf("../Processed/Processed_%s_%s_%s_%s_%s.Rdata", d, c, s, a, p))) { return("Skipped") }
+
+            # filter period of interest from full dataset, create importance subsample for initial fit to determine starting values for complex GAMs
+            df <- df_dcsa %>% filter(peri == p) %>% select(-peri)
+            di <- df %>% mutate(t = round(tmpc, 0)) %>% group_by(date, tmpc) %>% slice_max(n = 1, order_by = pop) %>% ungroup() %>% select(-t)
+
+            # convert data frame to list for DLNM (using summation convention)
+            lf <- list(n = df$n, pop = df$pop, yday = df$yday, year = df$year, tmpc = data.matrix(df %>% select(matches("tmpc_lag_"))), lags = matrix(rep(0:MAX_LAG, each = nrow(df)), nrow = nrow(df), byrow = FALSE))
+            li <- list(n = di$n, pop = di$pop, yday = di$yday, year = di$year, tmpc = data.matrix(di %>% select(matches("tmpc_lag_"))), lags = matrix(rep(0:MAX_LAG, each = nrow(di)), nrow = nrow(di), byrow = FALSE))
 
             # aggregate deaths over the 7 days of each week to compute the weekly mean rate, move lagged averaged temperature and humidity exposures to 7 columns
-            dw <- df %>% group_by(code, year, monday) %>% mutate(rate = sum(n) / sum(pop), pop = mean(pop)) %>% ungroup() %>% arrange(code, year, monday, wday)
-            dw <- list(year       = dw %>% filter(wday == 1) %>% pull("year"),
-                       rate       = dw %>% filter(wday == 1) %>% pull("rate"),
-                       pop        = dw %>% filter(wday == 1) %>% pull("pop"),
-                       yday       = data.matrix(dw %>% select(code, year, monday, wday, yday)       %>% pivot_wider(names_from = wday, names_prefix = "yday", values_from = yday)       %>% select(starts_with("yday"))),
-                       tmpc_lag_a = data.matrix(dw %>% select(code, year, monday, wday, tmpc_lag_a) %>% pivot_wider(names_from = wday, names_prefix = "tmpc", values_from = tmpc_lag_a) %>% select(starts_with("tmpc"))), 
-                       hump_lag_a = data.matrix(dw %>% select(code, year, monday, wday, hump_lag_a) %>% pivot_wider(names_from = wday, names_prefix = "hump", values_from = hump_lag_a) %>% select(starts_with("hump"))))
+            lw <- df %>% group_by(code, year, monday) %>% mutate(rate = sum(n) / sum(pop), pop = mean(pop)) %>% ungroup() %>% arrange(code, year, monday, wday)
+            lw <- list(rate = lw %>% filter(wday == 1) %>% pull("rate"),
+                       pop  = lw %>% filter(wday == 1) %>% pull("pop"),
+                       year = lw %>% filter(wday == 1) %>% pull("year"),
+                       yday = data.matrix(lw %>% select(code, monday, wday, yday) %>% pivot_wider(names_from = wday, names_prefix = "yday", values_from = yday) %>% select(matches("^yday"))),
+                       tmpc = data.matrix(lw %>% select(code, monday, wday, tmpc) %>% pivot_wider(names_from = wday, names_prefix = "tmpc", values_from = tmpc) %>% select(matches("^tmpc"))))
 
-            # prepare to evaluate weekly/daily model on daily/daily data, leveraging the implicit summation, i.e., using 7 days with identical exposures for correct balance between parametric and smooth terms!
-            dp <- list(year       = df$year,
-                       rate       = df$rate,
-                       pop        = df$pop,
-                       yday       = data.matrix(data.frame(y1 = df$yday,       y2 = df$yday,       y3 = df$yday,       y4 = df$yday,       y5 = df$yday,       y6 = df$yday,       y7 = df$yday)), 
-                       tmpc_lag_a = data.matrix(data.frame(t1 = df$tmpc_lag_a, t2 = df$tmpc_lag_a, t3 = df$tmpc_lag_a, t4 = df$tmpc_lag_a, t5 = df$tmpc_lag_a, t6 = df$tmpc_lag_a, t7 = df$tmpc_lag_a)), 
-                       hump_lag_a = data.matrix(data.frame(h1 = df$hump_lag_a, h2 = df$hump_lag_a, h3 = df$hump_lag_a, h4 = df$hump_lag_a, h5 = df$hump_lag_a, h6 = df$hump_lag_a, h7 = df$hump_lag_a)))
-            if (sum(is.na(dw$year)) + sum(is.na(dw$rate)) + sum(is.na(dw$pop)) + sum(is.na(dw$yday)) != 0) { stop("Lookup failed for covariates (week/day models)") }
-            if (sum(is.na(dp$year)) + sum(is.na(dp$rate)) + sum(is.na(dp$pop)) + sum(is.na(dp$yday)) != 0) { stop("Lookup failed for covariates (week/day prediction)") }
-            if (sum(is.na(dw$tmpc_lag_a)) + sum(is.na(dw$hump_lag_a)) != 0) { stop("Pivot(s) failed for exposures (week/day models)") }
-            if (sum(is.na(dp$tmpc_lag_a)) + sum(is.na(dp$hump_lag_a)) != 0) { stop("Pivot(s) failed for exposures (week/day prediction)") }
+            # prepare to evaluate the weekly model on daily ground truth data
+            ew <- list(rate = df$rate, pop = df$pop, year = df$year,
+                       yday = matrix(rep(df$yday, 7), nrow = nrow(df), byrow = FALSE),
+                       tmpc = matrix(rep(df$tmpc, 7), nrow = nrow(df), byrow = FALSE))
 
-            # equidistant knots for temperature exposure (above 10°C): step size 4°C, decreased down to 1°C in case of convergence problems
-            for (delta_tmpc in c(4, 3, 2, 1)) {
-              # define list of fixed knots by region of interest, adjusting spacing for temperature if necessary, 4 equidistant points for humidity
-              k <- list(tmpc_lag_0 = knots_tmpc(df$tmpc_lag_0, delta_tmpc), hump_lag_0 = knots_hump(df$hump_lag_0, 4),
-                        tmpc_lag_1 = knots_tmpc(df$tmpc_lag_1, delta_tmpc), hump_lag_1 = knots_hump(df$hump_lag_1, 4),
-                        tmpc_lag_2 = knots_tmpc(df$tmpc_lag_2, delta_tmpc), hump_lag_2 = knots_hump(df$hump_lag_2, 4),
-                        tmpc_lag_3 = knots_tmpc(df$tmpc_lag_3, delta_tmpc), hump_lag_3 = knots_hump(df$hump_lag_3, 4),
-                        tmpc_lag_4 = knots_tmpc(df$tmpc_lag_4, delta_tmpc), hump_lag_4 = knots_hump(df$hump_lag_4, 4),
-                        tmpc_lag_5 = knots_tmpc(df$tmpc_lag_5, delta_tmpc), hump_lag_5 = knots_hump(df$hump_lag_5, 4),
-                        tmpc_lag_a = knots_tmpc(df$tmpc_lag_a, delta_tmpc), hump_lag_a = knots_hump(df$hump_lag_a, 4))
+            # define list of fixed knots for cubic regression splines, by range of interest for temperature, for GAMs (all knots)
+            kl <- list(tmpc        = all_knots_tmpc(lf$tmpc), lags = seq(0, MAX_LAG, 2))
+            kf <- list(tmpc        = all_knots_tmpc(df$tmpc),
+                       tmpc_lag_0  = all_knots_tmpc(df$tmpc_lag_0),
+                       tmpc_lag_1  = all_knots_tmpc(df$tmpc_lag_1),
+                       tmpc_lag_2  = all_knots_tmpc(df$tmpc_lag_2),
+                       tmpc_lag_3  = all_knots_tmpc(df$tmpc_lag_3),
+                       tmpc_lag_4  = all_knots_tmpc(df$tmpc_lag_4),
+                       tmpc_lag_5  = all_knots_tmpc(df$tmpc_lag_5),
+                       tmpc_lag_6  = all_knots_tmpc(df$tmpc_lag_6),
+                       tmpc_lag_7  = all_knots_tmpc(df$tmpc_lag_7),
+                       tmpc_lag_8  = all_knots_tmpc(df$tmpc_lag_8),
+                       tmpc_lag_9  = all_knots_tmpc(df$tmpc_lag_9),
+                       tmpc_lag_10 = all_knots_tmpc(df$tmpc_lag_10),
+                       tmpc_lag_11 = all_knots_tmpc(df$tmpc_lag_11),
+                       tmpc_lag_12 = all_knots_tmpc(df$tmpc_lag_12),
+                       tmpc_lag_13 = all_knots_tmpc(df$tmpc_lag_13),
+                       tmpc_lag_14 = all_knots_tmpc(df$tmpc_lag_14))
 
-              # DLNM_PO full DLNM without smoothness constraints along the lag dimension, potentially overfitting, multiplicative (poisson, log link)
-              # DE03_PO simple model with daily outcome and lagged exposure (averaged over prior 0:3 days), multiplicative (poisson, log link)
-              # DE03_GA simple model with daily outcome and lagged exposure (averaged over prior 0:3 days), additive (gaussian, identity link)
-              # WE03_GA simple model with weekly outcome and lagged exposure (averaged over prior 0:3 days), additive (gaussian, identity link), implicit summation
-              DLNM_PO <- bam(n ~ offset(log(pop)) + year + ti(yday, bs = "cr", k = 3) + te(tmpc_lag_0, hump_lag_0, bs = "cr", k = c(length(k[["tmpc_lag_0"]]), length(k[["hump_lag_0"]]))) +
-                                                                                        te(tmpc_lag_1, hump_lag_1, bs = "cr", k = c(length(k[["tmpc_lag_1"]]), length(k[["hump_lag_1"]]))) +
-                                                                                        te(tmpc_lag_2, hump_lag_2, bs = "cr", k = c(length(k[["tmpc_lag_2"]]), length(k[["hump_lag_2"]]))) +
-                                                                                        te(tmpc_lag_3, hump_lag_3, bs = "cr", k = c(length(k[["tmpc_lag_3"]]), length(k[["hump_lag_3"]]))) +
-                                                                                        te(tmpc_lag_4, hump_lag_4, bs = "cr", k = c(length(k[["tmpc_lag_4"]]), length(k[["hump_lag_4"]]))) +
-                                                                                        te(tmpc_lag_5, hump_lag_5, bs = "cr", k = c(length(k[["tmpc_lag_5"]]), length(k[["hump_lag_5"]]))),
-                             data = df, discrete = TRUE, nthreads = get_num_cores(), knots = k, family = poisson(link = "log"))
-              DE03_PO <- bam(n ~ offset(log(pop)) + year + ti(yday, bs = "cr", k = 3) + te(tmpc_lag_a, hump_lag_a, bs = "cr", k = c(length(k[["tmpc_lag_a"]]), length(k[["hump_lag_a"]]))),
-                             data = df, discrete = TRUE, nthreads = get_num_cores(), knots = k, family = poisson(link = "log"))
-              DE03_GA <- bam(rate ~ 1             + year + ti(yday, bs = "cr", k = 3) + te(tmpc_lag_a, hump_lag_a, bs = "cr", k = c(length(k[["tmpc_lag_a"]]), length(k[["hump_lag_a"]]))),
-                             data = df, discrete = TRUE, nthreads = get_num_cores(), knots = k, family = gaussian(link = "identity"), weights = pop)
-              WE03_GA <- bam(rate ~ 1             + year + ti(yday, bs = "cr", k = 3) + te(tmpc_lag_a, hump_lag_a, bs = "cr", k = c(length(k[["tmpc_lag_a"]]), length(k[["hump_lag_a"]]))),
-                             data = dw, discrete = TRUE, nthreads = get_num_cores(), knots = k, family = gaussian(link = "identity"), weights = pop)
+            # Five model types defined by their regression formulas
+            # SC = GAM,  daily  outcomes and daily temp/humid. exposures, lags, w/o  smoothness constraints along lag, multiplicative (counts, nb, log link), sensitivity analysis
+            # DC = DLNM, daily  outcomes and daily temperature exposures, lags, with smoothness constraints along lag, multiplicative (counts, nb, log link), coded as a tensor GAM
+            # AC = GAM,  daily  outcomes and daily temperature exposures, averaged over 0-3 prior days,                multiplicative (counts, nb, log link)
+            # AR = GAM,  daily  outcomes and daily temperature exposures, averaged over 0-3 prior days,                additive (rates, gaussian, identity link)
+            # WR = GAM,  weekly outcomes and daily temperature exposures, averaged over 0-3 prior days,                additive (rates, gaussian, identity link)
+            fSC <- n ~ offset(log(pop)) + s(year, bs = "cr", k = 3) + s(yday, bs = "cr", k = 3) + te(tmpc_lag_0,  hump_lag_0,  bs = "cr", k = c(length(kf$tmpc_lag_0),  3)) +
+                                                                                                  te(tmpc_lag_1,  hump_lag_1,  bs = "cr", k = c(length(kf$tmpc_lag_1),  3)) +
+                                                                                                  te(tmpc_lag_2,  hump_lag_2,  bs = "cr", k = c(length(kf$tmpc_lag_2),  3)) +
+                                                                                                  te(tmpc_lag_3,  hump_lag_3,  bs = "cr", k = c(length(kf$tmpc_lag_3),  3)) +
+                                                                                                  te(tmpc_lag_4,  hump_lag_4,  bs = "cr", k = c(length(kf$tmpc_lag_4),  3)) +
+                                                                                                  te(tmpc_lag_5,  hump_lag_5,  bs = "cr", k = c(length(kf$tmpc_lag_5),  3)) +
+                                                                                                  te(tmpc_lag_6,  hump_lag_6,  bs = "cr", k = c(length(kf$tmpc_lag_6),  3)) +
+                                                                                                  te(tmpc_lag_7,  hump_lag_7,  bs = "cr", k = c(length(kf$tmpc_lag_7),  3)) +
+                                                                                                  te(tmpc_lag_8,  hump_lag_8,  bs = "cr", k = c(length(kf$tmpc_lag_8),  3)) +
+                                                                                                  te(tmpc_lag_9,  hump_lag_9,  bs = "cr", k = c(length(kf$tmpc_lag_9),  3)) +
+                                                                                                  te(tmpc_lag_10, hump_lag_10, bs = "cr", k = c(length(kf$tmpc_lag_10), 3)) +
+                                                                                                  te(tmpc_lag_11, hump_lag_11, bs = "cr", k = c(length(kf$tmpc_lag_11), 3)) +
+                                                                                                  te(tmpc_lag_12, hump_lag_12, bs = "cr", k = c(length(kf$tmpc_lag_12), 3)) +
+                                                                                                  te(tmpc_lag_13, hump_lag_13, bs = "cr", k = c(length(kf$tmpc_lag_13), 3)) +
+                                                                                                  te(tmpc_lag_14, hump_lag_14, bs = "cr", k = c(length(kf$tmpc_lag_14), 3))
+            fDC <- n ~ offset(log(pop)) + s(year, bs = "cr", k = 3) + s(yday, bs = "cr", k = 3) + te(tmpc,        lags,        bs = "cr", k = c(length(kl$tmpc), length(kl$lags)))
+            fAC <- n ~ offset(log(pop)) + s(year, bs = "cr", k = 3) + s(yday, bs = "cr", k = 3) +  s(tmpc,                     bs = "cr", k =   length(kf$tmpc))
+            fAR <- rate ~                 s(year, bs = "cr", k = 3) + s(yday, bs = "cr", k = 3) +  s(tmpc,                     bs = "cr", k =   length(kf$tmpc))
+            fWR <- rate ~                 s(year, bs = "cr", k = 3) + s(yday, bs = "cr", k = 3) +  s(tmpc,                     bs = "cr", k =   length(kf$tmpc))
 
-              # check for convergence, report if finer grid of knots was required
-              if (DLNM_PO$conv && DLNM_PO$mgcv.conv && DE03_PO$conv && DE03_PO$mgcv.conv && DE03_GA$conv && DE03_GA$mgcv.conv && WE03_GA$conv && WE03_GA$mgcv.conv) {
-                if (delta_tmpc != 4) { print(sprintf("ALL CONVERGED at delta_tmpc = %s (%s %s %s %s %s)", delta_tmpc, p, c, d, s, a)) }
-                break
-              }
-            }
+            # compute the five models (bam(formula, family, data, weights, ...)), and retrieve predicted responses
+            SC  <- bam(fSC, nb(),       di,                                            knots = kf, chunk = 16384, gc = 2)
+            SC  <- bam(fSC, nb(),       df,                coef = SC$coef, sp = SC$sp, knots = kf, chunk = 16384, gc = 2); SCp <-          predict.gam(SC,     type = "response", se.fit = FALSE, discrete = FALSE)
+            DC  <- bam(fDC, nb(),       li,                                            knots = kl, chunk = 16384, gc = 2)
+            DC  <- bam(fDC, nb(),       lf,                coef = DC$coef, sp = DC$sp, knots = kl, chunk = 16384, gc = 2); DCp <-          predict.gam(DC,     type = "response", se.fit = FALSE, discrete = FALSE)
+            AC  <- bam(fAC, nb(),       di,                                            knots = kf, chunk = 16384, gc = 2)
+            AC  <- bam(fAC, nb(),       df,                coef = AC$coef, sp = AC$sp, knots = kf, chunk = 16384, gc = 2); ACp <-          predict.gam(AC,     type = "response", se.fit = FALSE, discrete = FALSE)
+            AR  <- bam(fAR, gaussian(), di, weights = pop,                             knots = kf, chunk = 16384, gc = 2)
+            AR  <- bam(fAR, gaussian(), df, weights = pop, coef = AR$coef, sp = AR$sp, knots = kf, chunk = 16384, gc = 2); ARp <- df$pop * predict.gam(AR,     type = "response", se.fit = FALSE, discrete = FALSE)
+            WR  <- bam(fWR, gaussian(), lw, weights = pop,                             knots = kf, chunk = 16384, gc = 2); WRp <- df$pop * predict.gam(WR, ew, type = "response", se.fit = FALSE, discrete = FALSE)
 
-            # report any convergence failures
-            if (!DLNM_PO$conv || !DLNM_PO$mgcv.conv) { print(sprintf("DLNM_PO: CONVERGENCE FAILED (%s %s %s %s %s)", p, c, d, s, a)) }
-            if (!DE03_PO$conv || !DE03_PO$mgcv.conv) { print(sprintf("DE03_PO: CONVERGENCE FAILED (%s %s %s %s %s)", p, c, d, s, a)) }
-            if (!DE03_GA$conv || !DE03_GA$mgcv.conv) { print(sprintf("DE03_GA: CONVERGENCE FAILED (%s %s %s %s %s)", p, c, d, s, a)) }
-            if (!WE03_GA$conv || !WE03_GA$mgcv.conv) { print(sprintf("WE03_GA: CONVERGENCE FAILED (%s %s %s %s %s)", p, c, d, s, a)) }
+            # data frame and list for evaluating exposure response (temperature only models), mid-year, 100,000 exposed persons, observed temperature range, 4th day at constant temperature
+            rf <- df %>% reframe(across(c(year, yday), ~ceiling(median(.x))), tmin = round(min(tmpc), 1), tmax = round(max(tmpc), 1)) %>%
+              group_by(year, yday) %>% reframe(tmpc = seq(tmin, tmax, 0.1), n = 0, pop = 100000, rate = 0) %>%
+              mutate(tmpc_lag_0  = tmpc, tmpc_lag_1  = tmpc, tmpc_lag_2  = tmpc, tmpc_lag_3  = tmpc,
+                     tmpc_lag_4  = 20.0, tmpc_lag_5  = 20.0, tmpc_lag_6  = 20.0, tmpc_lag_7  = 20.0,
+                     tmpc_lag_8  = 20.0, tmpc_lag_9  = 20.0, tmpc_lag_10 = 20.0, tmpc_lag_11 = 20.0,
+                     tmpc_lag_12 = 20.0, tmpc_lag_13 = 20.0, tmpc_lag_14 = 20.0)
+            rl <- list(n = rf$n, pop = rf$pop, rate = rf$rate, year = rf$year, yday = rf$yday,
+                       tmpc = data.matrix(rf %>% select(matches("tmpc_lag_"))),
+                       lags = matrix(rep(0:MAX_LAG, each = nrow(rf)), nrow = nrow(rf), byrow = FALSE))
+            rw <- list(n = rf$n, pop = rf$pop, rate = rf$rate, year = rf$year,
+                       yday = matrix(rep(rf$yday, 7), nrow = nrow(rf), byrow = FALSE),
+                       tmpc = matrix(rep(rf$tmpc, 7), nrow = nrow(rf), byrow = FALSE))
 
-            # evaluate fits to observed data, on a daily basis, extract meta-information from regressions
-            fits <- df %>% select(year, yday, tmpc_lag_0, n, pop) %>% mutate(DLNM_PO =       predict(DLNM_PO, type = "response"),
-                                                                             DE03_PO =       predict(DE03_PO, type = "response"),
-                                                                             DE03_GA = pop * predict(DE03_GA, type = "response"),
-                                                                             WE03_GA = pop * predict(WE03_GA, type = "response", newdata = dp))
-            days_total <- fits %>% group_by(year, yday)       %>% reframe(across(c(n, pop, DLNM_PO, DE03_PO, DE03_GA, WE03_GA), ~sum(.x))) %>% mutate(year = year + min(years_in_period))
-            tmpc_total <- fits %>% group_by(year, tmpc_lag_0) %>% reframe(across(c(n, pop, DLNM_PO, DE03_PO, DE03_GA, WE03_GA), ~sum(.x))) %>% mutate(year = year + min(years_in_period))
-            parametric <- rbind(tidy(DLNM_PO, parametric = TRUE)  %>% mutate(model = "DLNM_PO"),
-                                tidy(DE03_PO, parametric = TRUE)  %>% mutate(model = "DE03_PO"),
-                                tidy(DE03_GA, parametric = TRUE)  %>% mutate(model = "DE03_GA"),
-                                tidy(WE03_GA, parametric = TRUE)  %>% mutate(model = "WE03_GA"))
-            te_smooths <- rbind(tidy(DLNM_PO, parametric = FALSE) %>% mutate(model = "DLNM_PO"),
-                                tidy(DE03_PO, parametric = FALSE) %>% mutate(model = "DE03_PO"),
-                                tidy(DE03_GA, parametric = FALSE) %>% mutate(model = "DE03_GA"),
-                                tidy(WE03_GA, parametric = FALSE) %>% mutate(model = "WE03_GA"))
-            
-            # save results for later analysis
-            save(p, c, d, s, a, days_total, tmpc_total, parametric, te_smooths, file = sprintf("../Processed/Processed_%s_%s_%s_%s_%s.Rdata", p, c, d, s, a))
-          }
+            # aggregate fits to observed data, evaluate responses to fixed exposure, extract meta-information from regressions
+            predicted <- df %>% select(year, yday, tmpc_lag_0, tmpc, n, pop) %>% mutate(SC = SCp, DC = DCp, AC = ACp, AR = ARp, WR = WRp)
+            responses <- rf %>% mutate(DC =       predict.gam(DC, rl, type = "response", se.fit = FALSE, disc = FALSE),
+                                       AC =       predict.gam(AC, rf, type = "response", se.fit = FALSE, disc = FALSE),
+                                       AR = pop * predict.gam(AR, rf, type = "response", se.fit = FALSE, disc = FALSE),
+                                       WR = pop * predict.gam(WR, rw, type = "response", se.fit = FALSE, disc = FALSE)) %>%
+                                select(-starts_with("tmpc_lag_"), -starts_with("hump_lag_"), -n, -rate, -year, -yday)
+            smoothies <- rbind(tidy(SC, parametric = FALSE) %>% select(term, p.value) %>% mutate(model = "SC", p.value = round(p.value, 3), AIC = AIC(SC)),
+                               tidy(DC, parametric = FALSE) %>% select(term, p.value) %>% mutate(model = "DC", p.value = round(p.value, 3), AIC = AIC(DC)),
+                               tidy(AC, parametric = FALSE) %>% select(term, p.value) %>% mutate(model = "AC", p.value = round(p.value, 3), AIC = AIC(AC)),
+                               tidy(AR, parametric = FALSE) %>% select(term, p.value) %>% mutate(model = "AR", p.value = round(p.value, 3), AIC = AIC(AR)),
+                               tidy(WR, parametric = FALSE) %>% select(term, p.value) %>% mutate(model = "WR", p.value = round(p.value, 3), AIC = AIC(WR)))
+
+            # document any convergence failures, save results
+            SC <- !SC$conv; DC <- !DC$conv; AC <- !AC$conv; AR <- !AR$conv; WR <- !WR$conv
+            save(d, c, s, a, p, predicted, responses, smoothies, SC, DC, AC, AR, WR, file = sprintf("../Processed/Processed_%s_%s_%s_%s_%s.Rdata", d, c, s, a, p))
+          })}
         }
       }
     }
   }
-```
-# Done
-
-```{r Done}
-  append_time_log("Processing completed")
-  time_log %>% flextable() %>% autofit()
-  rstudioapi::versionInfo(); sessionInfo()
+  append_time_log("Processing completed"); time_log %>% flextable() %>% autofit(); rstudioapi::versionInfo(); sessionInfo()
 ```

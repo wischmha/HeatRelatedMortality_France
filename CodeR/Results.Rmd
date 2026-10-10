@@ -1,7 +1,7 @@
 ---
 title:  "Heatwave mortality in France from 1990 to 2025 in high spatiotemporal resolution"
 author: "Hans-Aloys Wischmann, Institute for Public Health, Charité - Universitätsmedizin Berlin"
-date:   "Rewritten: 2026-05-16 to 2026-07-09 / Executed: `r Sys.Date()`"
+date:   "Rewritten: 2026-05-16 to 2026-10-09 / Executed: `r Sys.Date()`"
 output:
   officedown::rdocx_document:
     reference_docx: Template.docx
@@ -15,121 +15,171 @@ output:
 ```{r setup, include = FALSE}
   source("./Parameters.R")
   library(scales)
+
+  model_acronyms <- c("SC", "DC", "AC", "AR", "WR")
+  model_labels   <- c("GAM\nT*RH\n(Counts)", "DLNM\nT*LAG\n(Counts)", "GAM\nAvg.Exp\n(Counts)", "GAM\nAvg.Exp\n(Rates)", "GAM\nWeekly\n(Rates)")
+  factor_model   <- function(v) { return(factor(v, ordered = TRUE,  levels = model_acronyms, labels = model_labels)) }
 ```
 # Load: Model Fits
 
-```{r Load_Fits}
-  fits <- list.files(path = "../Processed", pattern = "^Processed.*[.]Rdata$", full.names = TRUE)
-  all_results <- foreach(f = fits, .packages = "tidyverse") %dopar% {
+```{r load_Fits}
+  # verify convergence of all models
+  conv <- foreach (f = list.files(path = "../Processed", pattern = "^Processed.*[.]Rdata$", full.names = TRUE), .packages = "tidyverse") %dopar% {
+    invisible(gc(verbose = FALSE, full = TRUE))
     load(f)
-    list(tmpc_total %>% mutate(period = p, climat = c, densite = d, sex = s, age = a),
-         days_total %>% mutate(period = p, climat = c, densite = d, sex = s, age = a),
-         parametric %>% mutate(period = p, climat = c, densite = d, sex = s, age = a),
-         te_smooths %>% mutate(period = p, climat = c, densite = d, sex = s, age = a))
+    if (SC | DC | AC | AR | WR) { data.frame(SC, DC, AC, AR, WR, d, c, s, a, p) } else { NULL }
   }
-  tmpc_total <- rbindlist(lapply(all_results, function(x){x[[1]]}))
-  days_total <- rbindlist(lapply(all_results, function(x){x[[2]]}))
-  parametric <- rbindlist(lapply(all_results, function(x){x[[3]]}))
-  te_smooths <- rbindlist(lapply(all_results, function(x){x[[4]]}))
-  print(sprintf("Total number of models fitted: %7d", length(fits)))
-  print(sprintf("Total number of summer deaths: %7d", sum(days_total$n)))
+  conv <- do.call(rbind, conv)
+  if (!is.null(conv)) {
+    conv %>% flextable() %>% set_caption("Convergence failure(s)") %>% autofit()
+    stop("Convergence failure(s) detected")
+  }
+
+  # aggregate shortest data.frame()
+  smoothies <- foreach (f = list.files(path = "../Processed", pattern = "^Processed.*[.]Rdata$", full.names = TRUE), .packages = "tidyverse") %dopar% {
+    invisible(gc(verbose = FALSE, full = TRUE))
+    load(f)
+    smoothies %>% mutate(densite = d, climat = c, sex = s, age = a, peri = p)
+  }
+  smoothies <- do.call(rbind, smoothies) %>% mutate(age = factor_age(age))
+
+  # aggregate medium data.frame() of mortality responses, treat floating point inaccuracies from process part (tmpc values from seq(..., ..., 0.1))
+  responses <- foreach (f = list.files(path = "../Processed", pattern = "^Processed.*[.]Rdata$", full.names = TRUE), .packages = "tidyverse") %dopar% {
+    invisible(gc(verbose = FALSE, full = TRUE))
+    load(f)
+    responses %>% mutate(densite = d, climat = c, sex = s, age = a, peri = p, tmpc = round(tmpc, 1))
+  }
+  responses <- do.call(rbind, responses) %>% mutate(age = factor_age(age))
+
+  # aggregate largest data.frame() of observed and predicted deaths by analysis day (year and yday) and rounded daily mean temperature (day of death)
+  predicted <- foreach (f = list.files(path = "../Processed", pattern = "^Processed.*[.]Rdata$", full.names = TRUE), .packages = "tidyverse") %dopar% {
+    invisible(gc(verbose = FALSE, full = TRUE))
+    load(f)
+    predicted <- predicted %>% mutate(tmpc = round(tmpc_lag_0, 0)) %>% group_by(year, yday, tmpc) %>% reframe(across(all_of(c(model_acronyms, "n", "pop")), ~sum(.x)))
+    predicted %>% mutate(densite = d, climat = c, sex = s, age = a, peri = p)
+  }
+  predicted <- do.call(rbind, predicted) %>% mutate(age = factor_age(age))
+
+  # proportion of deaths for which the tensor term te(tmpc, hump) in the sensitivity model SC was statistically significant, by lag in days and age group
+  signif_te <- left_join(smoothies %>% filter(model == "SC", str_sub(term, 1, 2) == "te"), predicted %>% group_by(densite, climat, sex, age, peri) %>% reframe(n = sum(n)), join_by(densite, climat, sex, age, peri)) %>%
+    mutate(Lag = as.integer(str_replace_all(term, c(".*_" = "", "[)]" = ""))))
+  signif_te <- rbind(signif_te, signif_te %>% mutate(age = "Total")) %>%
+    group_by(Lag, age) %>% reframe(prop_sig = sprintf("%.01f%%", 100.0 * sum(n * (p.value < 0.05)) / sum(n))) %>%
+    pivot_wider(values_from = prop_sig, names_from = age)
+  signif_te %>%
+    flextable() %>% set_caption("Proportion of observed deaths for which te(tmpc,hump) was significant (p < 0.05), by age group and lag [days]") %>% autofit() %>% align(align = "right")
+
+  # report total number of observed summer deaths, by densite
+  n_years <- length(unique(predicted$year))
+  n_days  <- nrow(predicted %>% select(year, yday) %>% distinct())
+  predicted %>% group_by(Urbanity = densite) %>% reframe(Deaths = sum(n), across(all_of(model_acronyms), ~as.integer(sum(.x)))) %>%
+    bind_rows(summarise(., across(where(is.numeric), sum), across(where(is.character), ~'Total'))) %>%
+    setNames(str_replace_all(names(.), setNames(as.character(factor_model(model_acronyms)), model_acronyms))) %>%
+    setNames(gsub("Deaths", "Observed\nDeaths", names(.))) %>%
+    flextable() %>% set_caption(sprintf("Summer deaths in France (%d summer days across %d years)", n_days, n_years)) %>% autofit() %>% hline(i = 3)
 ```
 # Check: Model Quality
 
-The mean absolute difference (MAD) between the predicted and the observed number of summer death is computed by year, climate, urbanization, sex, age group, and mean temperature (current day, lag = 0 days, rounded to 1°C). For each temperature, and by sex age group, the plot shows the mean MAD across all analysis years, climates, and urbanizations (line) as well as the minimum and maximum (ribbon edges), for each of the four models.
+The mean absolute error (MAE) between the predicted and the observed total number of deaths across France is computed by analysis day (year and day of year), sex, and age group. Scatter plots depict the residuals, i.e., the observed minus the predicted number of deaths across France by mean daily temperature (lag = 0), for each analysis day, by sex and age group, comparing the DLNM on the x-axis to either the Weekly GAM or the Sensitivity GAM on the y-axis.
 
-```{r MAD}
-  tmpc_mad <- tmpc_total %>% mutate(tmpc_lag_0 = round(tmpc_lag_0, 0)) %>%
-    group_by(year, climat, densite, sex, age, tmpc_lag_0) %>% reframe(across(matches("(PO|GA)$"), ~mean(abs(.x - n)))) %>%
-    pivot_longer(c(DLNM_PO, DE03_PO, DE03_GA, WE03_GA), names_to = "Model") %>%
-    mutate(Model = factor(Model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA"))) %>%
-    mutate(age = factor(age, levels = rev(AGE_BRACKETS$age))) %>%
-    group_by(sex, age, tmpc_lag_0, Model) %>% reframe(ymean = mean(value), ymin = min(value), ymax = max(value))
-  plot_pdf_png("Figure_2", aspect_ratio = 1.4,
-    tmpc_mad %>%
-    ggplot(aes(x = tmpc_lag_0, y = ymean, ymin = ymin, ymax = ymax, color = Model, fill = Model)) +
-      geom_line() + geom_ribbon(alpha = 0.1, fill = NA, linewidth = 0.1) +
-      scale_y_continuous(breaks = pretty_breaks(n = 5)) +
-      labs(x = "Mean Temperature [°C] (Lag=0, Buckets=1°C)", y = "Mean Absolute Difference (MAD) between Predicted and Observed Number of Summer Deaths (by Year, Climate, Urbanization)") +
-      std_theme() + theme(legend.position = "top") + facet_grid(vars(age), vars(sex), scales = "free_y"))
+```{r model_quality}
+  # mean absolute error (MAE) for total daily death rates by sex, and age group, across analysis days (year and yday)
+  predicted %>% group_by(year, yday, sex, age) %>% reframe(across(all_of(c(model_acronyms, "n", "pop")), ~sum(.x))) %>%
+    group_by(sex, age) %>% reframe(across(all_of(model_acronyms), ~100000.0 * mean(abs(n - .x) / pop)), Observed_Rate = 100000.0 * sum(n) / sum(pop)) %>%
+    mutate(Best_MAE = pmin(SC, DC, AC, AR, WR)) %>% mutate(across(all_of(model_acronyms), ~gsub("[+]0.0000", ".", sprintf("+%.04f", .x - Best_MAE))), across(c(Best_MAE, Observed_Rate), ~sprintf("%.04f", .x))) %>%
+    setNames(str_replace_all(names(.), setNames(as.character(factor_model(model_acronyms)), model_acronyms))) %>% setNames(str_replace_all(names(.), c("_" = "\n"))) %>%
+    select(Sex = sex, Age = age, starts_with("Obs"), starts_with("Best"), everything()) %>%
+    flextable() %>% set_caption("Mean absolute error (MAE) for daily death rates [1/100k] across all analysis days") %>% autofit() %>% align(j = 3:9, align = "right") %>% align(align = "center", part = "header")
+
+  # scatter plots for residuals (between predicted and observed deaths by mean daily temperature, by day, sex, age group, to assess similarities/differences between models
+  plot_pdf_png("Figure_S1", 1.3,
+    predicted %>% filter(tmpc >= 10.0) %>% group_by(year, yday, sex, age, tmpc) %>% reframe(across(all_of(model_acronyms), ~sum(n - .x))) %>% select(tmpc, sex, age, x = DC, y = SC) %>%
+    ggplot(aes(x = x, y = y, color = tmpc)) + geom_abline(slope = 1, intercept = 0, color = "gray80") + geom_hline(yintercept = 0, color = "gray80") + geom_vline(xintercept = 0, color = "gray80") + geom_point(size = 0.1) +
+      labs(x = gsub("\n", " ", setNames(as.character(factor_model(model_acronyms)), model_acronyms)["DC"]), y = gsub("\n", " ", setNames(as.character(factor_model(model_acronyms)), model_acronyms)["SC"]), color = "") +
+      scale_y_continuous(breaks = seq(-100, 100, 50), limits = c(-100, 100)) + scale_x_continuous(breaks = seq(-100, 100, 50), limits = c(-100, 100)) +
+      scale_color_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(10.0, 37.0), labels = ~paste(., "°C")) + facet_grid(vars(age), vars(sex)))
+  plot_pdf_png("Figure_S2", 1.3,
+    predicted %>% filter(tmpc >= 10.0) %>% group_by(year, yday, sex, age, tmpc) %>% reframe(across(all_of(model_acronyms), ~sum(n - .x))) %>% select(tmpc, sex, age, x = DC, y = WR) %>%
+    ggplot(aes(x = x, y = y, color = tmpc)) + geom_abline(slope = 1, intercept = 0, color = "gray80") + geom_hline(yintercept = 0, color = "gray80") + geom_vline(xintercept = 0, color = "gray80") + geom_point(size = 0.1) +
+      labs(x = gsub("\n", " ", setNames(as.character(factor_model(model_acronyms)), model_acronyms)["DC"]), y = gsub("\n", " ", setNames(as.character(factor_model(model_acronyms)), model_acronyms)["WR"]), color = "") +
+      scale_y_continuous(breaks = seq(-100, 100, 50), limits = c(-100, 100)) + scale_x_continuous(breaks = seq(-100, 100, 50), limits = c(-100, 100)) +
+      scale_color_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(10.0, 37.0), labels = ~paste(., "°C")) + facet_grid(vars(age), vars(sex)))
 ```
-# Check: Fit Quality
 
-```{r QQ}
-  # QQ plot for mortality rate residuals, by year, day of year, climat, densite, sex and age group
-  plot_pdf_png("Figure_3", aspect_ratio = 1.4,
-    days_total %>%
-      mutate(across(c(DLNM_PO, DE03_PO, DE03_GA, WE03_GA), ~100000.0 * (n - .x) / pop)) %>%
-      pivot_longer(c(DLNM_PO, DE03_PO, DE03_GA, WE03_GA), names_to = "Model", values_to = "Rate_Residuals") %>%
-      mutate(Model = factor(Model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA"))) %>%
-      mutate(age = factor(age, levels = rev(AGE_BRACKETS$age))) %>%
-    ggplot(aes(sample = Rate_Residuals, group = Model, color = Model)) +
-      stat_qq(size = 0.01) + stat_qq_line(linewidth = 0.2) +
-      scale_x_continuous(breaks = -2:2) +
-      labs(x = "Theoretical Quantiles (Normal Distribution, Standard Deviations)", y = "Sample Residuals: Daily Mortality Rate [1/100k] (by Year, Day of Year, Climate, Urbanization)") +
-      std_theme() + theme(legend.position = "top") + facet_grid(vars(age), vars(sex), scales = "free_y"))
+The final checks show the mean absolute error (MAE) and the mean error (BIAS) as well as their respective 99% confidence intervals (ribbon edges), for each of the models, by sex, age, and daily mean temperature, across all analysis days.
+
+```{r MAE_BIAS}
+  se.mean <- function(vec) { return(max(sd(vec, na.rm = TRUE), 0.0, na.rm = TRUE) / sqrt(max(sum(!is.na(vec)), 1.0))) }
+  diff <- predicted %>% group_by(year, yday, sex, age, tmpc) %>% reframe(across(all_of(model_acronyms), ~sum(n - .x))) %>% pivot_longer(all_of(model_acronyms), names_to = "Model") %>% mutate(Model = factor_model(Model))
+  plot_pdf_png("Figure_3", aspect_ratio = 1.3,
+    diff %>% mutate(value = abs(value)) %>% group_by(sex, age, tmpc, Model) %>% reframe(ymean = mean(value), se = se.mean(value), ymin = ymean + qnorm(0.005) * se, ymax = ymean + qnorm(0.995) * se) %>%
+    ggplot(aes(x = tmpc, y = ymean, ymin = ymin, ymax = ymax, color = Model, fill = Model)) +
+      geom_line() + geom_ribbon(alpha = 0.1, fill = NA, linewidth = 0.1) +
+      scale_x_continuous(breaks = pretty_breaks(n = 5)) +
+      scale_y_continuous(breaks = pretty_breaks(n = 3)) +
+      scale_color_manual(values = safe_colorblind_palette) +
+      labs(x = "Daily mean temperature [°C]", y = sprintf("Absolute difference between observed and predicted daily deaths:\nMAE and its 99%% confidence interval (%d summer days)", n_days)) +
+      std_theme() + theme(legend.position = "top") + facet_grid(vars(age), vars(sex)))
+  plot_pdf_png("Figure_4", aspect_ratio = 1.3,
+    diff %>%                                group_by(sex, age, tmpc, Model) %>% reframe(ymean = mean(value), se = se.mean(value), ymin = ymean + qnorm(0.005) * se, ymax = ymean + qnorm(0.995) * se) %>%
+    ggplot(aes(x = tmpc, y = ymean, ymin = ymin, ymax = ymax, color = Model, fill = Model)) +
+      geom_line() + geom_ribbon(alpha = 0.1, fill = NA, linewidth = 0.1) +
+      scale_x_continuous(breaks = pretty_breaks(n = 5)) +
+      scale_y_continuous(breaks = pretty_breaks(n = 3)) +
+      scale_color_manual(values = safe_colorblind_palette) +
+      labs(x = "Daily mean temperature [°C]", y = sprintf("Difference between observed and predicted daily deaths:\nBIAS and its 99%% confidence interval (%d summer days)", n_days)) +
+      std_theme() + theme(legend.position = "top") + facet_grid(vars(age), vars(sex)))
 ```
 # Plot: Mortality
 
-```{r Plot}
-  # aggregate fitted values to country level, by period, climat, densite, sex, age group, and by 1°C buckets
-  total_rates <- tmpc_total %>% filter(tmpc_lag_0 >= 9.0, tmpc_lag_0 <= 31.0) %>% mutate(t = 2.0 * round(tmpc_lag_0 * 0.5, 0)) %>%
-    group_by(period, climat, densite, sex, age, t) %>% reframe(across(c(n, DLNM_PO, DE03_PO, DE03_GA, WE03_GA), ~100000.0 * sum(.x) / sum(pop)), tmpc_lag_0 = sum(tmpc_lag_0 * pop) / sum(pop)) %>%
-    mutate(text = ifelse(period == "1998-2004" & t == 10.0, age, "")) %>%
-    select(period, climat, densite, sex, age, tmpc_lag_0, text, DLNM_PO, DE03_PO, DE03_GA, WE03_GA) %>% pivot_longer(c(DLNM_PO, DE03_PO, DE03_GA, WE03_GA), names_to = "Model") %>%
-    mutate(Model = factor(Model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA")), text = ifelse(Model == "WE03_GA", text, "")) %>%
-    mutate(climat = factor(climat, levels = c("Océanique", "Océanique altéré", "Semi-continental", "Montagnard", "Méditerranéen"))) %>%
-    mutate(densite = factor(densite, levels = c("Urbain dense", "Urbain intermédiaire", "Rural")), age = factor(age, levels = rev(AGE_BRACKETS$age))) %>%
-    mutate(period = fct_rev(period)) %>%
-    group_by(period, climat, densite, sex, age, tmpc_lag_0, text) %>% mutate(ymin = min(value), ymax = max(value)) %>% ungroup()
+```{r plot_mortality}
+  # descriptive, model-free aggregated observed mortality by analysis period and 1°C buckets for the daily mean temperature, (restricted to at least 100000 person-days of exposure)
+  plot_pdf_png("Figure_1", aspect_ratio = 0.8, plot_width = 4.5,
+    predicted %>% filter(tmpc >= 10.0) %>% select(tmpc, n, pop, peri) %>%
+      group_by(peri, tmpc) %>% reframe(n = sum(n), pop = sum(pop)) %>% filter(pop > 100000.0) %>% mutate(rate = 100000.0 * n / pop) %>%
+    ggplot(aes(x = tmpc, y = rate, group = peri, color = peri, fill = peri)) +
+        geom_point() + geom_line() +
+        scale_x_continuous(limits = c(9, 36), breaks = seq(10, 35, 5)) + scale_y_continuous(limits = c(0, NA), breaks = seq(0, 10, 2)) +
+        scale_fill_manual (values = safe_colorblind_palette[c(5, 2, 4, 10)]) +
+        scale_color_manual(values = safe_colorblind_palette[c(5, 2, 4, 10)]) +
+        labs(x = "Daily mean temperature [°C] (Lag=0)", y = "Daily mortality rate [1/100,000] (Summer)", color = "", fill = "") +
+        std_theme() + theme(legend.position = "top", legend.direction = "horizontal", legend.box = "vertical", legend.box.just = "left", legend.spacing = unit(0, "cm"), legend.margin = margin(0, 0, 0, 0)))
 
-  # plot fitted mortality rates, all models, by period, climat, densite, sex, and age group
-  for (s in unique(total_rates$sex)) {
-    plot_pdf_png(paste("Figure_1_40_99", s, sep = "_"), aspect_ratio = 1.4,
-      total_rates %>% filter(sex == s, age %in% c("40-59", "60-79", "80-89", "90+"), Model == "WE03_GA") %>% filter(value > 0, ymin > 0, ymax > 0) %>%
-      ggplot(aes(x = tmpc_lag_0, y = value, ymin = ymin, ymax = ymax, group = interaction(period, age), color = period, fill = period)) +
-          geom_line(linewidth = 0.2) + geom_ribbon(color = NA, linewidth = 0.1, alpha = 0.1) +
-          geom_text(aes(x = 9.0, y = value, label = text), size = 1.5, hjust = 0.5, angle = 90.0, color = "grey50") +
-          scale_x_continuous(breaks = seq(10, 35, 5), limits = c(8, NA)) +
-          scale_y_continuous(trans = "log10", breaks = c(0.01, 0.02, 0.04, 0.10, 0.20, 0.40, 1.0, 2.0, 4.0, 10.0, 20.0, 40.0, 100.0, 200.0, 400.0), labels = ~sprintf("%.1f", .x)) +
-          scale_color_manual(values = safe_colorblind_palette[c(10, 4, 8, 2, 5)]) +
-          scale_fill_manual (values = safe_colorblind_palette[c(10, 4, 8, 2, 5)]) +
-          labs(x = "Mean Temperature [°C] (Lag=0, Buckets=2°C, Range=9..31°C)", y = sprintf("Daily Mortality Rate [1/100,000]: %s (40-99)", s), color = "Period", fill = "Period") +
+  # aggregate fitted values to country level, by peri, climat, densite, sex, age group, and by 1°C buckets
+  rates_predicted <- responses %>% filter(tmpc >= 15.0) %>%
+    select(peri, climat, densite, sex, age, tmpc, any_of(model_acronyms)) %>% pivot_longer(any_of(model_acronyms), names_to = "Model") %>%
+    mutate(Model = factor_model(Model), climat = factor_climat(climat), densite = factor_densite(densite)) %>%
+    filter(value > 0) %>% group_by(peri, climat, densite, sex, age, tmpc) %>% mutate(ymin = min(value), ymax = max(value)) %>% ungroup() %>%
+    mutate(densite = fct_rev(densite)) %>% mutate(text = ifelse(tmpc == 15.0 & Model == "GAM\nWeekly\n(Rates)" & peri == "2000-2004", as.character(age), ""))
+
+  # plot fitted mortality rates, all models, by peri, climat, densite, sex, and age group
+  for (s in unique(rates_predicted$sex)) {
+    plot_pdf_png(paste("Figure_2_40_99", s, sep = "_"), aspect_ratio = 1.0,
+      rates_predicted %>% filter(sex == s, age %in% c("40-59", "60-79", "80-89", "90+")) %>% mutate(Model = gsub("\n", " ", as.character(Model))) %>%
+      ggplot(aes(x = tmpc, y = value, ymin = ymin, ymax = ymax, group = interaction(peri, age, Model), color = peri, fill = peri, linetype = Model)) +
+          geom_line(linewidth = 0.2) + geom_ribbon(color = NA, linewidth = 0.1, alpha = 0.05) +
+          geom_text(aes(x = 14.0, label = text), size = 1.5, hjust = 0.5, angle = 90.0, color = "grey50") +
+          scale_x_continuous(breaks = seq(15, 30, 5), limits = c(13.5, NA)) +
+          scale_y_continuous(trans = "log10", limits = c(0.1, 800.0), breaks = c(0.10, 0.20, 0.40, 1.0, 2.0, 4.0, 10.0, 20.0, 40.0, 100.0, 200.0, 400.0), labels = ~sprintf("%.1f", .x)) +
+          scale_color_manual(values = safe_colorblind_palette[c(5, 2, 4, 10)]) +
+          scale_fill_manual (values = safe_colorblind_palette[c(5, 2, 4, 10)]) +
+          labs(x = "Daily mean temperature [°C] (4 consecutive days)", y = sprintf("Day #4 mortality rate [1/100,000]: %s", s), color = "", fill = "", linetype = "") +
           std_theme() + theme(legend.position = "top", legend.direction = "horizontal", legend.box = "vertical", legend.box.just = "left", legend.spacing = unit(0, "cm"), legend.margin = margin(0, 0, 0, 0)) +
-          facet_grid(vars(densite), vars(climat), scales = "free_y"))
-    plot_pdf_png(paste("Figure_1_00_39", s, sep = "_"), aspect_ratio = 1.4,
-      total_rates %>% filter(sex == s, !age %in% c("40-59", "60-79", "80-89", "90+"), Model == "WE03_GA", period %in% c("1998-2004", "2019-2025")) %>% filter(value > 0, ymin > 0, ymax > 0) %>%
-      ggplot(aes(x = tmpc_lag_0, y = value, ymin = ymin, ymax = ymax, group = interaction(period, age), color = period, fill = period)) +
-          geom_line(linewidth = 0.2) + geom_ribbon(color = NA, linewidth = 0.1, alpha = 0.1) +
-          geom_text(aes(x = 9.0, y = value, label = text), size = 1.5, hjust = 0.5, angle = 90.0, color = "grey50") +
-          scale_x_continuous(breaks = seq(10, 35, 5), limits = c(8, NA)) +
-          scale_y_continuous(trans = "log10", breaks = c(0.01, 0.02, 0.04, 0.10, 0.20, 0.40, 1.0, 2.0, 4.0, 10.0, 20.0, 40.0, 100.0, 200.0, 400.0), labels = ~sprintf("%.2f", .x)) +
-          scale_color_manual(values = safe_colorblind_palette[c(10, 2)]) +
-          scale_fill_manual (values = safe_colorblind_palette[c(10, 2)]) +
-          labs(x = "Mean Temperature [°C] (Lag=0, Buckets=2°C, Range=9..31°C)", y = sprintf("Daily Mortality Rate [1/100,000]: %s (00-39)", s), color = "Period", fill = "Period") +
+          facet_grid(vars(densite), vars(climat)))
+    plot_pdf_png(paste("Figure_2_00_39", s, sep = "_"), aspect_ratio = 1.0,
+      rates_predicted %>% filter(sex == s, !age %in% c("40-59", "60-79", "80-89", "90+"), peri %in% c("2000-2004", "2015-2025")) %>% mutate(Model = gsub("\n", " ", as.character(Model))) %>%
+      ggplot(aes(x = tmpc, y = value, ymin = ymin, ymax = ymax, group = interaction(peri, age, Model), color = peri, fill = peri, linetype = Model)) +
+          geom_line(linewidth = 0.2) + geom_ribbon(color = NA, linewidth = 0.1, alpha = 0.05) +
+          geom_text(aes(x = 14.0, y = value, label = text), size = 1.5, hjust = 0.5, angle = 90.0, color = "grey50") +
+          scale_x_continuous(breaks = seq(15, 30, 5), limits = c(13.5, NA)) +
+          scale_y_continuous(trans = "log10", limits = c(0.0005, 1.0000), breaks = c(0.01, 0.02, 0.04, 0.10, 0.20, 0.40, 1.0, 2.0, 4.0, 10.0, 20.0, 40.0, 100.0, 200.0, 400.0), labels = ~sprintf("%.2f", .x)) +
+          scale_color_manual(values = safe_colorblind_palette[c(2, 10)]) +
+          scale_fill_manual (values = safe_colorblind_palette[c(2, 10)]) +
+          labs(x = "Daily mean temperature [°C] (4 consecutive days)", y = sprintf("Day #4 mortality rate [1/100,000]: %s", s), color = "", fill = "", linetype = "") +
           std_theme() + theme(legend.position = "top", legend.direction = "horizontal", legend.box = "vertical", legend.box.just = "left", legend.spacing = unit(0, "cm"), legend.margin = margin(0, 0, 0, 0)) +
-          facet_grid(vars(densite), vars(climat), scales = "free_y"))
+          facet_grid(vars(densite), vars(climat)))
   }
-  parametric %>% mutate(model = factor(model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA"))) %>% filter(term != "(Intercept)") %>%
-    group_by(term, sex, age, model) %>% reframe(prop_sig = 100.0 * sum(p.value < 0.05) / n()) %>% mutate(prop_sig = ifelse(prop_sig > 50, sprintf("%.01f", prop_sig), "")) %>%
-    pivot_wider(names_from = model, values_from = prop_sig) %>%
-    select(Sex = sex, Age = age, matches("_"), Term = term) %>%
-    flextable() %>% set_caption("Significance of parametric terms (proportion with p.value < 0.05, if > 50.0%)") %>% autofit() %>% align(align = "center", part = "all") %>% hline(6)
-  te_smooths %>% mutate(model = factor(model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA"))) %>% filter(term == "te(hump_lag_a,tmpc_lag_a)", model != "DLNM_PO") %>%
-    group_by(term, sex, age, model) %>% reframe(prop_sig = 100.0 * sum(p.value < 0.05) / n()) %>% mutate(prop_sig = ifelse(prop_sig > 50, sprintf("%.01f", prop_sig), "")) %>%
-    pivot_wider(names_from = model, values_from = prop_sig) %>%
-    select(Sex = sex, Age = age, matches("_")) %>%
-    flextable() %>% set_caption("Significance of te(tmpc_lag_a,hump_lag_a) (proportion with p.value < 0.05, if > 50.0%)") %>% autofit() %>% align(align = "center", part = "all") %>% hline(6)
-  te_smooths %>% mutate(model = factor(model, levels = c("DLNM_PO", "DE03_PO", "DE03_GA", "WE03_GA"))) %>% filter(term == "ti(yday)", model != "DLNM_PO") %>%
-    group_by(term, sex, age, model) %>% reframe(prop_sig = 100.0 * sum(p.value < 0.05) / n()) %>% mutate(prop_sig = ifelse(prop_sig > 50, sprintf("%.01f", prop_sig), "")) %>%
-    pivot_wider(names_from = model, values_from = prop_sig) %>%
-    select(Sex = sex, Age = age, matches("_")) %>%
-    flextable() %>% set_caption("Significance of ti(yday) (proportion with p.value < 0.05, if > 50.0%)") %>% autofit() %>% align(align = "center", part = "all") %>% hline(6)
-```
-# Done
 
-```{r Done}
-  append_time_log("Processing completed")
-  time_log %>% flextable() %>% autofit()
-  rstudioapi::versionInfo(); sessionInfo()
+  # document execution time(s) and versions
+  append_time_log("Processing completed"); time_log %>% flextable() %>% autofit(); rstudioapi::versionInfo(); sessionInfo()
 ```

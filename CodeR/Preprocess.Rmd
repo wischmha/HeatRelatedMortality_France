@@ -1,7 +1,7 @@
 ---
 title:  "Heatwave mortality in France from 1990 to 2025 in high spatiotemporal resolution"
 author: "Hans-Aloys Wischmann, Institute for Public Health, Charité - Universitätsmedizin Berlin"
-date:   "Rewritten: 2026-05-16 to 2026-07-08 / Executed: `r Sys.Date()`"
+date:   "Rewritten: 2026-05-16 to 2026-09-03 / Executed: `r Sys.Date()`"
 output:
   officedown::rdocx_document:
     reference_docx: Template.docx
@@ -14,6 +14,7 @@ output:
 
 ```{r setup, include = FALSE}
   source("./Parameters.R")
+  library(data.table)
   library(readxl)
   library(ncdf4)
 
@@ -30,7 +31,7 @@ output:
                   data.frame(climat = "Montagnard",       departement = c("64", "65", "09", "12", "48", "19", "15", "43", "23", "63", "42",
                                                                           "04", "05", "38", "73", "74")),
                   data.frame(climat = "Méditerranéen",    departement = c("66", "11", "34", "30", "13", "84", "83", "06", "07", "26", "2A", "2B"))) %>%
-    mutate(climat = factor(climat, levels = c("Océanique", "Océanique altéré", "Semi-continental", "Montagnard", "Méditerranéen")))
+    mutate(climat = factor_climat(climat))
 ```
 # Geography: Communes (2025)
 
@@ -38,7 +39,7 @@ output:
   # communes (https://www.data.gouv.fr/api/1/datasets/r/c70a1c2d-dc8a-4f33-90df-ece3692b2baf) at 50m resolution, append climate type by departement
   # append rurality (https://www.insee.fr/fr/statistiques/fichier/8571524/fichier_diffusion_2025.xlsx) by commune, ordered rural, intermediate, urban
   densite  <- read_excel("../Downloads/Rurality.xlsx", skip = 4) %>% select(code = CODGEO, densite = LIBDENS)
-  geo_info  <- as.data.frame(read_sf("../Downloads/Shapes.geojson")) %>% select(code, region, departement, geometry, commune = nom) %>%
+  geo_info <- as.data.frame(read_sf("../Downloads/Shapes.geojson")) %>% select(code, region, departement, geometry, commune = nom) %>%
     filter(code %in% COG_METRO) %>% left_join(., CLIMAT, by = "departement") %>% left_join(., densite,  by = "code") %>%
     mutate(densite = ifelse(is.na(densite) & grepl("Arrondissement$", commune), "Urbain dense", densite)) %>%
     mutate(densite = factor_densite(densite))
@@ -146,20 +147,20 @@ output:
 
   # utility function to read, parse, and extract relevant data from ncdf file
   read_nc <- function(filename, variable, geo_info, start_date) {
-    nc_file    <- nc_open(filename)
-    nc_date    <- ncvar_get(nc_file, "time") + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
-    nc_long    <- ncvar_get(nc_file, "longitude")
-    nc_lati    <- ncvar_get(nc_file, "latitude")
-    idx_date   <- first(which(nc_date >= start_date))
-    idx_long   <- first(which(nc_long >= min(geo_info$X) - 0.10))
-    idx_lati   <- first(which(nc_lati >= min(geo_info$Y) - 0.10))
-    num_long   <- last( which(nc_long <= max(geo_info$X) + 0.10)) - idx_long + 1
-    num_lati   <- last( which(nc_lati <= max(geo_info$Y) + 0.10)) - idx_lati + 1
-    nc_date    <- ncvar_get(nc_file, "time", start = idx_date) + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
-    nc_long    <- 0.10 * floor(10.0 * ncvar_get(nc_file, "longitude", start = idx_long, count = num_long)) + 0.05
-    nc_lati    <- 0.10 * floor(10.0 * ncvar_get(nc_file, "latitude",  start = idx_lati, count = num_lati)) + 0.05
-    data_3D    <- ncvar_get(nc_file, variable, start = c(idx_long, idx_lati, idx_date), count = c(num_long, num_lati, -1))
-    nc_status  <- nc_close(nc_file)
+    nc_file   <- nc_open(filename)
+    nc_date   <- ncvar_get(nc_file, "time") + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
+    nc_long   <- ncvar_get(nc_file, "longitude")
+    nc_lati   <- ncvar_get(nc_file, "latitude")
+    idx_date  <- first(which(nc_date >= start_date))
+    idx_long  <- first(which(nc_long >= min(geo_info$X) - 0.10))
+    idx_lati  <- first(which(nc_lati >= min(geo_info$Y) - 0.10))
+    num_long  <- last( which(nc_long <= max(geo_info$X) + 0.10)) - idx_long + 1
+    num_lati  <- last( which(nc_lati <= max(geo_info$Y) + 0.10)) - idx_lati + 1
+    nc_date   <- ncvar_get(nc_file, "time", start = idx_date) + as.Date(gsub("days since ", "", ncatt_get(nc_file, "time", "units")$value))
+    nc_long   <- 0.10 * floor(10.0 * ncvar_get(nc_file, "longitude", start = idx_long, count = num_long)) + 0.05
+    nc_lati   <- 0.10 * floor(10.0 * ncvar_get(nc_file, "latitude",  start = idx_lati, count = num_lati)) + 0.05
+    data_3D   <- ncvar_get(nc_file, variable, start = c(idx_long, idx_lati, idx_date), count = c(num_long, num_lati, -1))
+    nc_status <- nc_close(nc_file)
 
     # determine combinations of longitude/latitude with valid temperature measurements (land areas), restrict to bounding box of metropolitan France with buffer
     valid_nc <- as.data.frame(which(!is.na(data_3D[,,1]), arr.ind = TRUE)) %>% mutate(long = nc_long[row], lati = nc_lati[col]) %>% rename(long_index = row, lati_index = col)
@@ -192,83 +193,85 @@ output:
 # Report, Visualize, and Save
 
 ```{r Plot_Save}
-  # document spread of recorded deaths across selected age groups, stratified by analysis period
-  deaths %>% mutate(year = year(date)) %>% left_join(., YEARS_PERIODS, by = "year") %>% filter(!is.na(period)) %>%
-    group_by(period, age) %>% reframe(n = n()) %>% group_by(period) %>% mutate(n = sprintf("%.01f%%", 100.0 * n / sum(n))) %>% ungroup() %>%
-    pivot_wider(names_from = period, values_from = n) %>%
+  # document spread of recorded deaths across selected age groups
+  deaths %>% mutate(year = year(date)) %>% filter(year %in% c(1990, 1999, 2006, 2011, 2016, 2022)) %>%
+    group_by(year, Age = age) %>% reframe(n = n()) %>%
+    group_by(year)            %>% mutate(n = sprintf("%.01f%%", 100.0 * n / sum(n))) %>% ungroup() %>%
+    pivot_wider(names_from = year, values_from = n) %>%
     flextable() %>% set_caption("Proportion of recorded deaths by age group") %>% align(align = "center", part = "all") %>% autofit()
 
   # plot and save in parallel to save time
-  time_par <- foreach (tag = c("Plot_1", "Plot_2", "Plot_3", "Save_1", "Save_2", "Save_3"), .packages = c("tidyverse", "dtplyr", "sf"), .combine = rbind) %dopar% {
+  time_par <- foreach (tag = 1:13, .packages = c("tidyverse", "dtplyr", "sf"), .combine = rbind) %dopar% {
     start_time <- proc.time()
-    if (tag == "Plot_1") {
+    if (tag == 1) {
       # daily deaths, caveat: unexplained data issues in summer of 1997, consistent with (https://www.deces-en-france.fr/evenements/annee-1997)
       plot_pdf_png("Figure_X1", aspect_ratio = 1.2,
         deaths %>% group_by(Sex = sex, date) %>% reframe(n = sum(n)) %>% mutate(p = year(date), p = p - (p - min(YEARS_ANALYZE)) %% 9, p = sprintf("%d-%d", p, p + 8)) %>%
         ggplot(aes(x = date, y = n, color = Sex)) + geom_line(linewidth = 0.3) +
           scale_x_continuous(breaks = YEAR_BREAKS, labels = YEAR_LABELS) + scale_y_continuous(transform = "log10") + scale_color_manual(values = safe_colorblind_palette) +
-          labs(x = "", y = "Daily Deaths") + std_theme() + theme(legend.position = "top", axis.ticks.x = element_blank()) + facet_wrap(~p, ncol = 1, scales = "free_x"))
+          labs(x = "", y = "Daily deaths") + std_theme() + theme(legend.position = "top", axis.ticks.x = element_blank()) + facet_wrap(~p, ncol = 1, scales = "free_x"))
+    } else if (tag == 2) {
       # daily deaths during heat waves of 2003 and 2019
       plot_pdf_png("Figure_X6", aspect_ratio = 1.0,
         deaths %>% filter((date >= as.Date("2003-08-01") & date <= as.Date("2003-08-20")) | (date >= as.Date("2019-07-14") & date <= as.Date("2019-08-02"))) %>%
           mutate(year = year(date)) %>% group_by(Age = age, Sex = sex, year, date) %>% reframe(n = sum(n)) %>%
         ggplot(aes(x = date, y = n, fill = Age)) + geom_bar(stat = "sum", position = "stack") + scale_fill_manual(values = safe_colorblind_palette) +
           labs(title = "Heat waves: August 2003 and July 2019", x = "", y = "Daily Deaths") + std_theme() + facet_grid(vars(Sex), vars(year), scales = "free"))
-      # climate category by departement
+    } else if (tag == 3) {
+      # climate category by département
       plot_pdf_png("Figure_X7", aspect_ratio = 1.2,
         geo_info %>% mutate(code = str_sub(code, 1, 2)) %>% group_by(climat, code) %>% mutate(geometry = st_union(geometry)) %>%
         ggplot(aes(geometry = geometry, fill = climat)) + geom_sf(color = "black", linewidth = 0.1) + coord_sf(crs = CRS_SF) +
-          scale_fill_manual(values = safe_climate_palette) +
-          labs(fill = "Climat") + std_theme())
+          scale_fill_manual(values = safe_climate_palette) + labs(fill = "Climat") + std_theme())
+    } else if (tag == 4) {
       # density category by commune
       plot_pdf_png("Figure_X8", aspect_ratio = 1.2,
         geo_info %>%
         ggplot(aes(geometry = geometry, fill = densite)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
-        labs(fill = "Densité") + std_theme())
-    } else if (tag == "Plot_2") {
+          labs(fill = "Densité") + std_theme())
+    } else if (tag == "5") {
       # heat wave of 2003
       plot_pdf_png("Figure_X2", aspect_ratio = 1.2,
         left_join(tmpc_info %>% filter(date >= as.Date("2003-08-01"), date <= as.Date("2003-08-20")) %>% mutate(across(!date, ~pmin(pmax(.x, 13.0), 37.0))) %>%
           pivot_longer(!date, names_to = "code", values_to = "tmpc"), geo_info, by = "code") %>%
         ggplot(aes(geometry = geometry, fill = tmpc)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
           scale_fill_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(13.0, 37.0), labels = ~paste(., "°C")) +
-          labs(title = "Heat wave: August 2003", fill = "Mean\nTemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+          labs(title = "Heat wave: August 2003", fill = "Mean\ntemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == "6") {
       plot_pdf_png("Figure_X3", aspect_ratio = 1.2,
         left_join(hump_info %>% filter(date >= as.Date("2003-08-01"), date <= as.Date("2003-08-20")) %>%
           pivot_longer(!date, names_to = "code", values_to = "hump"), geo_info, by = "code") %>%
         ggplot(aes(geometry = geometry, fill = hump)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
           scale_fill_gradientn(colors = safe_humidity_palette, breaks = seq(10, 90, 20), limits = c(0, 100), labels = ~paste(., "%")) +
-          labs(title = "Heat wave: August 2003", fill = "Relative\nHumidity") + std_theme() + facet_wrap(~date, nrow = 5))
-    } else if (tag == "Plot_3") {
+          labs(title = "Heat wave: August 2003", fill = "Relative\nhumidity") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == "7") {
       # heat wave of 2019
       plot_pdf_png("Figure_X4", aspect_ratio = 1.2,
         left_join(tmpc_info %>% filter(date >= as.Date("2019-07-14"), date <= as.Date("2019-08-02")) %>% mutate(across(!date, ~pmin(pmax(.x, 13.0), 37.0))) %>%
           pivot_longer(!date, names_to = "code", values_to = "tmpc"), geo_info, by = "code") %>%
         ggplot(aes(geometry = geometry, fill = tmpc)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
           scale_fill_gradientn(colors = safe_heatmap_palette, breaks = seq(15, 35, 5), limits = c(13.0, 37.0), labels = ~paste(., "°C")) +
-          labs(title = "Heat wave: July 2019", fill = "Mean\nTemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+          labs(title = "Heat wave: July 2019", fill = "Mean\ntemperature") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == "8") {
       plot_pdf_png("Figure_X5", aspect_ratio = 1.2,
         left_join(hump_info %>% filter(date >= as.Date("2019-07-14"), date <= as.Date("2019-08-02")) %>%
           pivot_longer(!date, names_to = "code", values_to = "hump"), geo_info, by = "code") %>%
         ggplot(aes(geometry = geometry, fill = hump)) + geom_sf(color = NA) + coord_sf(crs = CRS_SF) +
           scale_fill_gradientn(colors = safe_humidity_palette, breaks = seq(10, 90, 20), limits = c(0, 100), labels = ~paste(., "%")) +
-          labs(title = "Heat wave: July 2019", fill = "Relative\nHumidity") + std_theme() + facet_wrap(~date, nrow = 5))
-    } else if (tag == "Save_1") {
+          labs(title = "Heat wave: July 2019", fill = "Relative\nhumidity") + std_theme() + facet_wrap(~date, nrow = 5))
+    } else if (tag == 9) {
       save(tmpc_info, file = "../Processed/Preprocessed_Temperature.Rdata", compress = "xz")
-    } else if (tag == "Save_2") {
+    } else if (tag == 10) {
       save(hump_info, file = "../Processed/Preprocessed_Humidity.Rdata",    compress = "xz")
-    } else if (tag == "Save_3") {
+    } else if (tag == 11) {
       save(deaths,    file = "../Processed/Preprocessed_Outcome.Rdata",     compress = "xz")
+    } else if (tag == 12) {
       save(pop_info,  file = "../Processed/Preprocessed_Population.Rdata",  compress = "xz")
+    } else if (tag == 13) {
       save(geo_info,  file = "../Processed/Preprocessed_Geography.Rdata",   compress = "xz")
     }
     simple_time_log(tag)
   }
-  append_time_log("Completed: Preprocessing")
-```
-# Done
-
-```{r Done}
-  rbind(time_log, time_par) %>% flextable() %>% autofit()
-  rstudioapi::versionInfo(); sessionInfo()
+  # done, report execution times and versions
+  append_time_log("Preprocessing completed"); rbind(time_log, time_par) %>% flextable() %>% autofit(); rstudioapi::versionInfo(); sessionInfo()
 ```
